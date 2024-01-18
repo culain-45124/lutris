@@ -3,11 +3,9 @@
 import os
 import shlex
 import time
-from gettext import gettext as _
 
 from lutris import runtime, settings
 from lutris.command import MonitoredCommand
-from lutris.exceptions import UnavailableRunnerError
 from lutris.runners import import_runner
 from lutris.util import linux, system
 from lutris.util.log import logger
@@ -16,8 +14,8 @@ from lutris.util.strings import split_arguments
 from lutris.util.wine.cabinstall import CabInstaller
 from lutris.util.wine.prefix import WinePrefixManager
 from lutris.util.wine.wine import (
-    WINE_DEFAULT_ARCH, WINE_DIR, detect_arch, detect_prefix_arch, get_overrides_env, get_real_executable,
-    is_installed_systemwide
+    WINE_DEFAULT_ARCH, WINE_DIR, detect_arch, get_overrides_env, get_real_executable, is_installed_systemwide,
+    is_prefix_directory
 )
 
 
@@ -114,9 +112,6 @@ def create_prefix(  # noqa: C901
         if not runner:
             runner = import_runner("wine")()
         wine_path = runner.get_executable()
-    if not wine_path:
-        logger.error("Wine not found, can't create prefix")
-        return
     wineboot_path = os.path.join(os.path.dirname(wine_path), "wineboot")
     if not system.path_exists(wineboot_path):
         logger.error(
@@ -266,8 +261,6 @@ def wineexec(  # noqa: C901
 
     if not wine_path:
         wine_path = runner.get_executable()
-    if not wine_path:
-        raise UnavailableRunnerError(_("Wine is not installed"))
 
     if not working_dir:
         if os.path.isfile(executable):
@@ -280,7 +273,7 @@ def wineexec(  # noqa: C901
     # Create prefix if necessary
     if arch not in ("win32", "win64"):
         arch = detect_arch(prefix, wine_path)
-    if not detect_prefix_arch(prefix):
+    if not is_prefix_directory(prefix):
         wine_bin = winetricks_wine if winetricks_wine else wine_path
         create_prefix(prefix, wine_path=wine_bin, arch=arch, runner=runner)
 
@@ -347,8 +340,6 @@ def find_winetricks(env=None, system_winetricks=False):
     if system_winetricks or not system.path_exists(winetricks_path):
         winetricks_path = system.find_executable("winetricks")
         working_dir = None
-        if not winetricks_path:
-            raise RuntimeError("No installation of winetricks found")
     else:
         # We will use our own zenity if available, which is here, and it
         # also needs a data file in this directory. We have to set the

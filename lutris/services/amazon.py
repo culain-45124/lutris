@@ -64,6 +64,7 @@ class AmazonService(OnlineService):
     id = "amazon"
     name = _("Amazon Prime Gaming")
     icon = "amazon"
+    runner = "wine"
     has_extras = False
     drm_free = False
     medias = {
@@ -501,8 +502,7 @@ class AmazonService(OnlineService):
         if not response:
             logger.error("There was an error getting patches: %s", game_id)
             raise UnavailableGameError(_(
-                "Unable to get the patches of game, "
-                "please check your Amazon credentials and internet connectivity"), game_id)
+                "Unable to get the patches of game"), game_id)
         return response
 
     def get_game_patches(self, game_id, version, file_list):
@@ -579,7 +579,7 @@ class AmazonService(OnlineService):
         except HTTPError as ex:
             logger.error("Failed http request %s", fuel_url)
             raise UnavailableGameError(_(
-                "Unable to get fuel.json file, please check your Amazon credentials")) from ex
+                "Unable to get fuel.json file.")) from ex
 
         try:
             res_yaml_text = request.text
@@ -621,7 +621,7 @@ class AmazonService(OnlineService):
 
         return game_cmd, game_args
 
-    def get_installer_files(self, installer, installer_file_id, selected_extras):
+    def get_installer_files(self, installer, _installer_file_id, _selected_extras):
         try:
             file_dict, __ = self.get_game_files(installer.service_appid)
         except HTTPError as err:
@@ -636,7 +636,12 @@ class AmazonService(OnlineService):
                 "size": file["size"]
             }))
         # return should be a list of files, so we return a list containing a InstallerFileCollection
-        return [InstallerFileCollection(installer.game_slug, "amazongame", files)]
+        file_collection = InstallerFileCollection(installer.game_slug, "amazongame", files)
+        return [file_collection], []
+
+    def get_installed_slug(self, db_game):
+        details = json.loads(db_game["details"])
+        return slugify(details["product"]["title"])
 
     def generate_installer(self, db_game):
         """Generate a installer for the Amazon game"""
@@ -672,7 +677,7 @@ class AmazonService(OnlineService):
             "version": _("Amazon Prime Gaming"),
             "slug": slugify(details["product"]["title"]),
             "game_slug": slugify(details["product"]["title"]),
-            "runner": "wine",
+            "runner": self.get_installed_runner_name(db_game),
             "script": {
                 "game": {
                     "exe": f"$GAMEDIR/drive_c/game/{game_cmd}",
@@ -685,3 +690,6 @@ class AmazonService(OnlineService):
                 "installer": installer
             }
         }
+
+    def get_installed_runner_name(self, db_game):
+        return self.runner

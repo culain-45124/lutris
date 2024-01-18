@@ -10,9 +10,9 @@ gi.require_version('PangoCairo', '1.0')
 import cairo
 from gi.repository import GLib, GObject, Gtk, Pango, PangoCairo
 
+from lutris.exceptions import MissingMediaError
 from lutris.gui.widgets.utils import (
-    get_default_icon_path, get_media_generation_number, get_runtime_icon_path, get_scaled_surface_by_path,
-    get_surface_size
+    MEDIA_CACHE_INVALIDATED, get_default_icon_path, get_runtime_icon_path, get_scaled_surface_by_path, get_surface_size
 )
 from lutris.scanners.lutris import is_game_missing
 
@@ -112,6 +112,29 @@ class GridViewCellRendererImage(Gtk.CellRenderer):
         self.badge_alpha = 0.6
         self.badge_fore_color = 1, 1, 1
         self.badge_back_color = 0, 0, 0
+        self._inset_fractions = {}
+
+    def inset_game(self, game_id: str, fraction: float) -> bool:
+        """This function indicates that a particular game should be displayed inset by a certain fraction of
+        its total size; 0 is full size, 0.1 would show it at 90% size, but centered.
+
+        This is not bound as an attribute; it's used for an ephemeral animation, and we wouldn't want
+        to mess with the GameStore to do it. Instead, the cell renderer tracks these per game ID, and
+        the caller uses queue_draw() to trigger a redraw.
+
+        Set the fraction to 0 for a game to remove the effect when done.
+
+        This returns True if it alters the inset of a game, and False if not because it was
+        already set that way."""
+        if fraction > 0.0:
+            if fraction != self._inset_fractions.get(game_id):
+                self._inset_fractions[game_id] = fraction
+                return True
+        elif game_id in self._inset_fractions:
+            del self._inset_fractions[game_id]
+            return True
+
+        return False
 
     @GObject.Property(type=int, default=0)
     def media_width(self):
@@ -195,30 +218,46 @@ class GridViewCellRendererImage(Gtk.CellRenderer):
         alpha = 1 if self.is_installed else 100 / 255
 
         if media_width > 0 and media_height > 0 and path:
-            surface = self.get_cached_surface_by_path(widget, path)
+            surface = self._get_cached_surface_by_path(widget, path)
             if not surface:
                 # The default icon needs to be scaled to fill the cell space.
                 path = get_default_icon_path((media_width, media_height))
-                surface = self.get_cached_surface_by_path(widget, path,
-                                                          preserve_aspect_ratio=False)
+                surface = self._get_cached_surface_by_path(widget, path,
+                                                           preserve_aspect_ratio=False)
             if surface:
                 x, y = self.get_media_position(surface, cell_area)
                 self.select_badge_metrics(surface)
 
+                cr.save()
+                inset_fraction = self._inset_fractions.get(self.game_id) or 0.0 if self.game_id else 0.0
+                if inset_fraction > 0:
+                    x += (cell_area.width * inset_fraction) / 2
+                    y += (cell_area.height * inset_fraction) / 2
+                    cell_area.y = 0
+                    cell_area.x = 0
+
+                    cr.translate(x, y)
+                    cr.scale(1 - inset_fraction, 1 - inset_fraction)
+                else:
+                    cell_area.y = 0
+                    cell_area.x = 0
+                    cr.translate(x, y)
+
                 if alpha >= 1:
-                    self.render_media(cr, widget, surface, x, y)
+                    self.render_media(cr, widget, surface, 0, 0)
                     if self.show_badges:
-                        self.render_platforms(cr, widget, surface, x, cell_area)
+                        self.render_platforms(cr, widget, surface, 0, cell_area)
 
                         if self.game_id and is_game_missing(self.game_id):
-                            self.render_text_badge(cr, widget, _("Missing"), x, cell_area.y + cell_area.height)
+                            self.render_text_badge(cr, widget, _("Missing"), 0, cell_area.y + cell_area.height)
                 else:
                     cr.push_group()
-                    self.render_media(cr, widget, surface, x, y)
+                    self.render_media(cr, widget, surface, 0, 0)
                     if self.show_badges:
-                        self.render_platforms(cr, widget, surface, x, cell_area)
+                        self.render_platforms(cr, widget, surface, 0, cell_area)
                     cr.pop_group_to_source()
                     cr.paint_with_alpha(alpha)
+                cr.restore()
 
             # Idle time will wait until the widget has drawn whatever it wants to;
             # we can then discard surfaces we aren't using anymore.
@@ -316,15 +355,31 @@ class GridViewCellRendererImage(Gtk.CellRenderer):
         right of 'media_right', if that will fit in 'cell_area'."""
         platform = self.platform
         if platform and self.badge_size:
-            if "," in platform:
-                platforms = platform.split(",")  # pylint:disable=no-member
-            else:
-                platforms = [platform]
-
-            icon_paths = [get_runtime_icon_path(p + "-symbolic") for p in platforms]
-            icon_paths = [path for path in icon_paths if path]
+            icon_paths = self.get_platform_icon_paths(platform)
             if icon_paths:
                 self.render_badge_stack(cr, widget, surface, surface_x, icon_paths, cell_area)
+
+    @staticmethod
+    def get_platform_icon_paths(platform):
+        if platform in GridViewCellRendererImage._platform_icon_paths:
+            return GridViewCellRendererImage._platform_icon_paths[platform]
+
+        if "," in platform:
+            platforms = platform.split(",")  # pylint:disable=no-member
+        else:
+            platforms = [platform]
+
+        icon_paths = []
+        for p in platforms:
+            try:
+                icon_paths.append(get_runtime_icon_path(p + "-symbolic"))
+            except MissingMediaError:
+                continue  # just leave the missing icons out
+
+        GridViewCellRendererImage._platform_icon_paths[platform] = icon_paths
+        return icon_paths
+
+    _platform_icon_paths = {}
 
     def render_badge_stack(self, cr, widget, surface, surface_x, icon_paths, cell_area):
         """Renders a vertical stack of badges, placed at the edge of the media, off to the right
@@ -342,7 +397,7 @@ class GridViewCellRendererImage(Gtk.CellRenderer):
             cr.set_source_rgba(back_color[0], back_color[1], back_color[2], alpha)
             cr.fill()
 
-            icon = self.get_cached_surface_by_path(widget, path, size=self.badge_size)
+            icon = self._get_cached_surface_by_path(widget, path, size=self.badge_size)
             cr.set_source_rgba(fore_color[0], fore_color[1], fore_color[2], alpha)
             cr.mask_surface(icon, badge_x, badge_y)
 
@@ -361,6 +416,7 @@ class GridViewCellRendererImage(Gtk.CellRenderer):
     def render_text_badge(self, cr, widget, text, left, bottom):
         """Draws a short text in the lower left corner of the media, in the
         style of a badge."""
+
         def get_layout():
             """Constructs a layout with the text to draw, but also returns its size
             in pixels. This is boldfaced, but otherwise in the default font."""
@@ -427,13 +483,13 @@ class GridViewCellRendererImage(Gtk.CellRenderer):
             self.cached_surfaces_loaded = 0
         self.cycle_cache_idle_id = None
 
-    def get_cached_surface_by_path(self, widget, path, size=None, preserve_aspect_ratio=True):
+    def _get_cached_surface_by_path(self, widget, path, size=None, preserve_aspect_ratio=True):
         """This obtains the scaled surface to rander for a given media path; this is cached
         in this render, but we'll clear that cache when the media generation number is changed,
         or certain properties are. We also age surfaces from the cache at idle time after
         rendering."""
-        if self.cached_surface_generation != get_media_generation_number():
-            self.cached_surface_generation = get_media_generation_number()
+        if self.cached_surface_generation != MEDIA_CACHE_INVALIDATED.generation_number:
+            self.cached_surface_generation = MEDIA_CACHE_INVALIDATED.generation_number
             self.clear_cache()
 
         key = widget, path, size, preserve_aspect_ratio
@@ -444,16 +500,18 @@ class GridViewCellRendererImage(Gtk.CellRenderer):
         if key in self.cached_surfaces_old:
             surface = self.cached_surfaces_old[key]
         else:
-            surface = self.get_surface_by_path(widget, path, size, preserve_aspect_ratio)
-            # We cache missing surfaces too, but only a successful load trigger
-            # cache cycling
-            if surface:
+            try:
+                surface = self._get_surface_by_path(widget, path, size, preserve_aspect_ratio)
+                # We cache missing surfaces too, but only a successful load trigger
+                # cache cycling
                 self.cached_surfaces_loaded += 1
+            except MissingMediaError:
+                surface = None
 
         self.cached_surfaces_new[key] = surface
         return surface
 
-    def get_surface_by_path(self, widget, path, size=None, preserve_aspect_ratio=True):
+    def _get_surface_by_path(self, widget, path, size=None, preserve_aspect_ratio=True):
         cell_size = size or (self.media_width, self.media_height)
         scale_factor = widget.get_scale_factor() if widget else 1
         return get_scaled_surface_by_path(path, cell_size, scale_factor,

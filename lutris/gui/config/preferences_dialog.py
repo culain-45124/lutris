@@ -6,12 +6,14 @@ from gi.repository import GObject, Gtk
 
 from lutris.config import LutrisConfig
 from lutris.gui.config.accounts_box import AccountsBox
-from lutris.gui.config.boxes import SystemBox
-from lutris.gui.config.common import GameDialogCommon
+from lutris.gui.config.boxes import SystemConfigBox
+from lutris.gui.config.game_common import GameDialogCommon
 from lutris.gui.config.preferences_box import InterfacePreferencesBox
 from lutris.gui.config.runners_box import RunnersBox
 from lutris.gui.config.services_box import ServicesBox
-from lutris.gui.config.sysinfo_box import SysInfoBox
+from lutris.gui.config.storage_box import StorageBox
+from lutris.gui.config.sysinfo_box import SystemBox
+from lutris.gui.config.updates_box import UpdatesBox
 
 
 class PreferencesDialog(GameDialogCommon):
@@ -20,7 +22,7 @@ class PreferencesDialog(GameDialogCommon):
     }
 
     def __init__(self, parent=None):
-        super().__init__(_("Lutris settings"), parent=parent)
+        super().__init__(_("Lutris settings"), config_level="system", parent=parent)
         self.set_border_width(0)
         self.set_default_size(1010, 600)
         self.lutris_config = LutrisConfig()
@@ -36,7 +38,9 @@ class PreferencesDialog(GameDialogCommon):
         sidebar.add(self.get_sidebar_button("runners-stack", _("Runners"), "applications-utilities-symbolic"))
         sidebar.add(self.get_sidebar_button("services-stack", _("Sources"), "application-x-addon-symbolic"))
         sidebar.add(self.get_sidebar_button("accounts-stack", _("Accounts"), "system-users-symbolic"))
-        sidebar.add(self.get_sidebar_button("sysinfo-stack", _("Hardware information"), "computer-symbolic"))
+        sidebar.add(self.get_sidebar_button("updates-stack", _("Updates"), "system-software-install-symbolic"))
+        sidebar.add(self.get_sidebar_button("sysinfo-stack", _("System"), "computer-symbolic"))
+        sidebar.add(self.get_sidebar_button("storage-stack", _("Storage"), "drive-harddisk-symbolic"))
         sidebar.add(self.get_sidebar_button("system-stack", _("Global options"), "emblem-system-symbolic"))
         hbox.pack_start(sidebar, False, False, 0)
         self.stack = Gtk.Stack(visible=True)
@@ -56,24 +60,39 @@ class PreferencesDialog(GameDialogCommon):
             self.build_scrolled_window(self.runners_box),
             "runners-stack"
         )
+
+        services_box = ServicesBox()
+        self.page_generators["services-stack"] = services_box.populate_services
         self.stack.add_named(
-            self.build_scrolled_window(ServicesBox()),
+            self.build_scrolled_window(services_box),
             "services-stack"
         )
 
+        accounts_box = AccountsBox()
+        self.page_generators["accounts-stack"] = accounts_box.populate_accounts
         self.stack.add_named(
-            self.build_scrolled_window(AccountsBox()),
+            self.build_scrolled_window(accounts_box),
             "accounts-stack"
         )
 
-        sysinfo_box = SysInfoBox()
+        self.stack.add_named(
+            self.build_scrolled_window(UpdatesBox()),
+            "updates-stack"
+        )
+
+        sysinfo_box = SystemBox()
         self.page_generators["sysinfo-stack"] = sysinfo_box.populate
         self.stack.add_named(
             self.build_scrolled_window(sysinfo_box),
             "sysinfo-stack"
         )
 
-        self.system_box = SystemBox(self.lutris_config)
+        self.stack.add_named(
+            self.build_scrolled_window(StorageBox()),
+            "storage-stack"
+        )
+
+        self.system_box = SystemConfigBox(self.config_level, self.lutris_config)
         self.page_generators["system-stack"] = self.system_box.generate_widgets
         self.stack.add_named(
             self.build_scrolled_window(self.system_box),

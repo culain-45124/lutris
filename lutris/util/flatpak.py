@@ -2,10 +2,12 @@ import shutil
 from gettext import gettext as _
 
 from lutris.exceptions import UnavailableRunnerError
+from lutris.util import cache_single
 from lutris.util.log import logger
 from lutris.util.system import read_process_output
 
 
+@cache_single
 def get_executable():
     """Return the executable used to access Flatpak. None if Flatpak is not installed.
 
@@ -29,6 +31,7 @@ def get_command():
     return [exe]
 
 
+@cache_single
 def get_installed_apps():
     if not is_installed():
         return []
@@ -67,6 +70,15 @@ def is_app_installed(appid):
 
 def get_run_command(appid, arch=None, fcommand=None, branch=None):
     """Return command to launch a Flatpak app"""
+    command = get_bare_run_command(arch, fcommand, branch)
+    command.append(appid)
+    return command
+
+
+def get_bare_run_command(arch=None, fcommand=None, branch=None):
+    """Return command to launch a Flatpak app, without the app-id at the end;
+    this is the 'command' of the flatpak runner itself, and a program's
+    appid must be appended to it."""
     command = get_command()
     command.append("run")
     if arch:
@@ -75,5 +87,4 @@ def get_run_command(appid, arch=None, fcommand=None, branch=None):
         command.append(f"--command={fcommand}")
     if branch:
         command.append(f"--branch={branch}")
-    command.append(appid)
     return command

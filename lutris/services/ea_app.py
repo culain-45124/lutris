@@ -15,8 +15,8 @@ from lutris.config import LutrisConfig, write_game_config
 from lutris.database.games import add_game, get_game_by_field
 from lutris.database.services import ServiceGameCollection
 from lutris.game import Game
-from lutris.installer import get_installers
 from lutris.services.base import OnlineService
+from lutris.services.lutris import sync_media
 from lutris.services.service_game import ServiceGame
 from lutris.services.service_media import ServiceMedia
 from lutris.util.log import logger
@@ -313,14 +313,15 @@ class EAAppService(OnlineService):
             logger.error("Invalid install of EA App at %s", ea_app_prefix)
             return
         ea_app_launcher = EAAppGames(ea_app_prefix)
-        installed_games = 0
+        installed_slugs = []
         for content_ids in ea_app_launcher.get_installed_games_content_ids():
-            self.install_from_ea_app(ea_app_game, content_ids)
-            installed_games += 1
-        logger.debug("Installed %s EA games", installed_games)
+            slug = self.install_from_ea_app(ea_app_game, content_ids)
+            if slug:
+                installed_slugs.append(slug)
+        sync_media(installed_slugs)
+        logger.debug("Installed %s EA games", len(installed_slugs))
 
     def install_from_ea_app(self, ea_game, content_ids):
-
         offer_id = content_ids[0]
         logger.debug("Installing EA game %s", offer_id)
         service_game = ServiceGameCollection.get_game("ea_app", offer_id)
@@ -334,10 +335,11 @@ class EAAppService(OnlineService):
         game_config = LutrisConfig(game_config_id=ea_game["configpath"]).game_level
         game_config["game"]["args"] = get_launch_arguments(",".join(content_ids))
         configpath = write_game_config(lutris_game_id, game_config)
-        game_id = add_game(
+        slug = self.get_installed_slug(ea_game)
+        add_game(
             name=service_game["name"],
             runner=ea_game["runner"],
-            slug=slugify(service_game["name"]),
+            slug=slug,
             directory=ea_game["directory"],
             installed=1,
             installer_slug=lutris_game_id,
@@ -345,7 +347,7 @@ class EAAppService(OnlineService):
             service=self.id,
             service_id=offer_id,
         )
-        return game_id
+        return slug
 
     def generate_installer(self, db_game, ea_db_game):
         ea_game = Game(ea_db_game["id"])
@@ -356,8 +358,8 @@ class EAAppService(OnlineService):
             "name": db_game["name"],
             "version": self.name,
             "slug": slugify(db_game["name"]) + "-" + self.id,
-            "game_slug": slugify(db_game["name"]),
-            "runner": self.runner,
+            "game_slug": self.get_installed_slug(db_game),
+            "runner": self.get_installed_runner_name(db_game),
             "appid": db_game["appid"],
             "script": {
                 "requires": self.client_installer,
@@ -378,13 +380,15 @@ class EAAppService(OnlineService):
             }
         }
 
+    def get_installed_runner_name(self, db_game):
+        return self.runner
+
     def install(self, db_game):
         ea_app_game = get_game_by_field(self.client_installer, "slug")
         application = Gio.Application.get_default()
         if not ea_app_game or not ea_app_game["installed"]:
             logger.warning("Installing the EA App client")
-            installers = get_installers(game_slug=self.client_installer)
-            application.show_installer_window(installers)
+            application.show_lutris_installer_window(game_slug=self.client_installer)
         else:
             application.show_installer_window(
                 [self.generate_installer(db_game, ea_app_game)],

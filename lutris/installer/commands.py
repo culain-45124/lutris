@@ -11,49 +11,51 @@ from pathlib import Path
 from gi.repository import GLib
 
 from lutris import runtime
-from lutris.cache import get_cache_path
+from lutris.cache import get_cache_path, has_custom_cache_path
 from lutris.command import MonitoredCommand
-from lutris.config import LutrisConfig
-from lutris.database.games import get_game_by_field
-from lutris.exceptions import UnavailableRunnerError, watch_errors
-from lutris.game import Game
+from lutris.exceptions import MissingExecutableError, UnspecifiedVersionError
 from lutris.installer.errors import ScriptingError
-from lutris.runners import import_task
+from lutris.installer.installer import LutrisInstaller
+from lutris.runners import InvalidRunnerError, import_runner, import_task
+from lutris.runners.wine import wine
 from lutris.util import extract, linux, selective_merge, system
 from lutris.util.fileio import EvilConfigParser, MultiOrderedDict
 from lutris.util.log import logger
-from lutris.util.wine.wine import WINE_DEFAULT_ARCH, get_wine_version_exe
+from lutris.util.wine.wine import WINE_DEFAULT_ARCH, get_default_wine_version, get_wine_path_for_version
 
 
 class CommandsMixin:
     """The directives for the `installer:` part of the install script."""
 
-    def _get_runner_version(self):
-        """Return the version of the runner used for the installer"""
-        if self.installer.runner == "wine":
-            # If a version is specified in the script choose this one
-            if self.installer.script.get(self.installer.runner):
-                return self.installer.script[self.installer.runner].get("version")
-            # If the installer is an extension, use the wine version from the base game
-            if self.installer.requires:
-                db_game = get_game_by_field(self.installer.requires, field="installer_slug")
-                if not db_game:
-                    db_game = get_game_by_field(self.installer.requires, field="slug")
-                if not db_game:
-                    logger.warning("Can't find game %s", self.installer.requires)
-                    return None
-                game = Game(db_game["id"])
-                return game.config.runner_config["version"]
-            # Look up the runner config setting, but only if it is explicitly set;
-            # install scripts do not get the usual default if it is not!
-            runner_config = LutrisConfig(runner_slug="wine")
-            if "wine" in runner_config.runner_level:
-                config_version = runner_config.runner_level["wine"].get("version")
-                if config_version:
-                    return config_version
-        if self.installer.runner == "libretro":
-            return self.installer.script["game"]["core"]
-        return None
+    # pylint: disable=no-member
+    installer: LutrisInstaller = NotImplemented
+
+    def get_wine_path(self) -> str:
+        """Return absolute path of wine version used during the installation, but
+        None if the wine exe can't be located."""
+        runner = self.get_runner_class(self.installer.runner)()
+        try:
+            version = runner.get_installer_runner_version(self.installer, use_runner_config=False)
+        except (UnspecifiedVersionError, RuntimeError):
+            # Special case that lets the Wine configuration explicit specify the path
+            # to the Wine executable, not just a version number.
+            if self.installer.runner == "wine":
+                try:
+                    config_version, runner_config = wine.get_runner_version_and_config()
+                    return get_wine_path_for_version(config_version, config=runner_config.runner_level)
+                except UnspecifiedVersionError:
+                    pass
+
+            version = get_default_wine_version()
+        return get_wine_path_for_version(version)
+
+    def get_runner_class(self, runner_name):
+        """Runner the runner class from its name"""
+        try:
+            runner = import_runner(runner_name)
+        except InvalidRunnerError as err:
+            raise ScriptingError(_("Invalid runner provided %s") % runner_name) from err
+        return runner
 
     @staticmethod
     def _check_required_params(params, command_data, command_name):
@@ -83,9 +85,9 @@ class CommandsMixin:
     @staticmethod
     def _is_cached_file(file_path):
         """Return whether a file referenced by file_id is stored in the cache"""
-        pga_cache_path = get_cache_path()
-        if not pga_cache_path:
+        if not has_custom_cache_path():
             return False
+        pga_cache_path = get_cache_path()
         return file_path.startswith(pga_cache_path)
 
     def chmodx(self, filename):
@@ -152,9 +154,11 @@ class CommandsMixin:
         if system.path_exists(exec_path) and not system.is_executable(exec_path):
             logger.warning("Making %s executable", exec_path)
             system.make_executable(exec_path)
-        exec_abs_path = system.find_executable(exec_path)
-        if not exec_abs_path:
-            raise ScriptingError(_("Unable to find executable %s") % exec_path)
+
+        try:
+            exec_abs_path = system.find_executable(exec_path)
+        except MissingExecutableError as ex:
+            raise ScriptingError(_("Unable to find executable %s") % exec_path) from ex
 
         if terminal:
             terminal = linux.get_default_terminal()
@@ -383,14 +387,6 @@ class CommandsMixin:
             runner_name = self.installer.runner
         return runner_name, task_name
 
-    def get_wine_path(self):
-        """Return absolute path of wine version used during the install, but
-        None if the wine exe can't be located."""
-        try:
-            return get_wine_version_exe(self._get_runner_version())
-        except UnavailableRunnerError:
-            return None
-
     def task(self, data):
         """Directive triggering another function specific to a runner.
 
@@ -407,9 +403,7 @@ class CommandsMixin:
             return_code = "0"
 
         if runner_name.startswith("wine"):
-            wine_path = self.get_wine_path()
-            if wine_path:
-                data["wine_path"] = wine_path
+            data["wine_path"] = self.get_wine_path()
             data["prefix"] = data.get("prefix") \
                 or self.installer.script.get("game", {}).get("prefix") \
                 or "$GAMEDIR"
@@ -442,7 +436,6 @@ class CommandsMixin:
             return "STOP"
         return None
 
-    @watch_errors(error_result=False)
     def _monitor_task(self, command):
         if not command.is_running:
             logger.debug("Return code: %s", command.return_code)

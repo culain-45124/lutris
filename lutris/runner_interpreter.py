@@ -2,9 +2,9 @@
 import os
 import shlex
 import stat
-from functools import lru_cache
 
-from lutris.util import system
+from lutris.exceptions import MissingExecutableError
+from lutris.util import cache_single, system
 from lutris.util.linux import LINUX_SYSTEM
 from lutris.util.log import logger
 
@@ -13,7 +13,7 @@ def get_mangohud_conf(system_config):
     """Return correct launch arguments and environment variables for Mangohud."""
     # The environment variable should be set to 0 on gamescope, otherwise the game will crash
     mangohud_val = "0" if system_config.get("gamescope") else "1"
-    if system_config.get("mangohud") and system.find_executable("mangohud"):
+    if system_config.get("mangohud") and system.can_find_executable("mangohud"):
         return ["mangohud"], {"MANGOHUD": mangohud_val, "MANGOHUD_DLSYM": "1"}
     return None, None
 
@@ -36,28 +36,34 @@ def get_launch_parameters(runner, gameplay_info):
 
     # Optimus
     optimus = system_config.get("optimus")
-    if optimus == "primusrun" and system.find_executable("primusrun"):
+    if optimus == "primusrun" and system.can_find_executable("primusrun"):
         launch_arguments.insert(0, "primusrun")
-    elif optimus == "optirun" and system.find_executable("optirun"):
+    elif optimus == "optirun" and system.can_find_executable("optirun"):
         launch_arguments.insert(0, "virtualgl")
         launch_arguments.insert(0, "-b")
         launch_arguments.insert(0, "optirun")
-    elif optimus == "pvkrun" and system.find_executable("pvkrun"):
+    elif optimus == "pvkrun" and system.can_find_executable("pvkrun"):
         launch_arguments.insert(0, "pvkrun")
 
     # MangoHud
-    mango_args, mango_env = get_mangohud_conf(system_config)
-    if mango_args:
-        launch_arguments = mango_args + launch_arguments
-        env.update(mango_env)
+    if runner.name == "steam":
+        logger.info(
+            "Do not enable Mangodhud for Steam games in Lutris. "
+            "Edit the launch options in Steam and set them to mangohud %%command%%"
+        )
+    else:
+        mango_args, mango_env = get_mangohud_conf(system_config)
+        if mango_args:
+            launch_arguments = mango_args + launch_arguments
+            env.update(mango_env)
 
     # Libstrangle
     fps_limit = system_config.get("fps_limit") or ""
     if fps_limit:
-        strangle_cmd = system.find_executable("strangle")
-        if strangle_cmd:
+        try:
+            strangle_cmd = system.find_executable("strangle")
             launch_arguments = [strangle_cmd, fps_limit] + launch_arguments
-        else:
+        except MissingExecutableError:
             logger.warning("libstrangle is not available on this system, FPS limiter disabled")
 
     prefix_command = system_config.get("prefix_command") or ""
@@ -102,8 +108,8 @@ def get_launch_parameters(runner, gameplay_info):
         launch_arguments.insert(0, "gamemoderun")
 
     # Gamescope
-    gamescope = system_config.get("gamescope") and system.find_executable("gamescope")
-    if gamescope:
+    has_gamescope = system_config.get("gamescope") and system.can_find_executable("gamescope")
+    if has_gamescope:
         launch_arguments = get_gamescope_args(launch_arguments, system_config)
 
     return launch_arguments, env
@@ -112,6 +118,8 @@ def get_launch_parameters(runner, gameplay_info):
 def get_gamescope_args(launch_arguments, system_config):
     """Insert gamescope at the start of the launch arguments"""
     launch_arguments.insert(0, "--")
+    if system_config.get("gamescope_force_grab_cursor"):
+        launch_arguments.insert(0, "--force-grab-cursor")
     if system_config.get("gamescope_fsr_sharpness"):
         gamescope_fsr_sharpness = system_config["gamescope_fsr_sharpness"]
         launch_arguments.insert(0, gamescope_fsr_sharpness)
@@ -143,14 +151,15 @@ def get_gamescope_args(launch_arguments, system_config):
     return launch_arguments
 
 
-@lru_cache()
+@cache_single
 def _get_gamescope_fsr_option():
     """Returns a list containing the arguments to insert to trigger FSR in gamescope;
     this changes in later versions, so we have to check the help output. There seems to be
     no way to query the version number more directly."""
-    if bool(system.find_executable("gamescope")):
+    if system.can_find_executable("gamescope"):
         # '-F fsr' is the trigger in gamescope 3.12.
-        help_text = system.execute(["gamescope", "--help"], capture_stderr=True)
+        stdout, stderr = system.execute_with_error(["gamescope", "--help"])
+        help_text = stdout + stderr
         if "-F, --filter" in help_text:
             return ["-F", "fsr"]
 

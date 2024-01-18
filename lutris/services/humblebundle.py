@@ -17,7 +17,6 @@ from lutris.services.service_media import ServiceMedia
 from lutris.util import linux
 from lutris.util.http import HTTPError, Request
 from lutris.util.log import logger
-from lutris.util.strings import slugify
 
 
 class HumbleBundleIcon(ServiceMedia):
@@ -132,10 +131,7 @@ class HumbleBundleService(OnlineService):
         try:
             request.get()
         except HTTPError:
-            logger.error(
-                "Failed to request %s, check your Humble Bundle credentials",
-                url,
-            )
+            logger.error("Failed to request %s", url)
             return
         return request.json
 
@@ -240,12 +236,11 @@ class HumbleBundleService(OnlineService):
         if not link:
             raise UnavailableGameError(_("No game found on Humble Bundle"))
         filename = link.split("?")[0].split("/")[-1]
-        return [
-            InstallerFile(installer.game_slug, installer_file_id, {
-                "url": link,
-                "filename": filename
-            })
-        ]
+        file = InstallerFile(installer.game_slug, installer_file_id, {
+            "url": link,
+            "filename": filename
+        })
+        return [file], []
 
     @staticmethod
     def get_filename_for_platform(downloads, platform):
@@ -314,7 +309,7 @@ class HumbleBundleService(OnlineService):
             "name": db_game["name"],
             "version": "Humble Bundle",
             "slug": details["machine_name"],
-            "game_slug": slugify(db_game["name"]),
+            "game_slug": self.get_installed_slug(db_game),
             "runner": runner,
             "humbleid": db_game["appid"],
             "script": {
@@ -326,6 +321,18 @@ class HumbleBundleService(OnlineService):
                 "installer": script
             }
         }
+
+    def get_installed_runner_name(self, db_game):
+        details = json.loads(db_game["details"])
+        platforms = [download["platform"] for download in details["downloads"]]
+
+        if "linux" in platforms and self.platform_has_downloads(details["downloads"], "linux"):
+            return "linux"
+
+        if "windows" in platforms:
+            return "wine"
+
+        return ""
 
 
 def pick_download_url_from_download_info(download_info):

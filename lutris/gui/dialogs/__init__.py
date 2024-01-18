@@ -1,6 +1,7 @@
 """Commonly used dialogs"""
 import os
 from gettext import gettext as _
+from typing import Callable
 
 import gi
 
@@ -10,6 +11,7 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gdk, GLib, GObject, Gtk
 
 from lutris import api, settings
+from lutris.exceptions import InvalidGameMoveError
 from lutris.gui.widgets.log_text_view import LogTextView
 from lutris.util import datapath
 from lutris.util.jobs import AsyncCall
@@ -18,22 +20,70 @@ from lutris.util.strings import gtk_safe
 
 
 class Dialog(Gtk.Dialog):
+    """A base class for dialogs that provides handling for the response signal;
+    you can override its on_response() methods, but that method will record
+    the response for you via 'response_type' or 'confirmed' and destory this
+    dialog if it isn't NONE."""
 
-    def __init__(self, title=None, parent=None, flags=0, buttons=None, **kwargs):
+    def __init__(self, title: str = None, parent: Gtk.Widget = None,
+                 flags: Gtk.DialogFlags = 0, buttons: Gtk.ButtonsType = None,
+                 **kwargs):
         super().__init__(title, parent, flags, buttons, **kwargs)
-        self.connect("delete-event", self.on_destroy)
+        self._response_type = Gtk.ResponseType.NONE
+        self.connect("response", self.on_response)
 
-    def on_destroy(self, _widget, _data=None):
-        self.destroy()
+    @property
+    def response_type(self) -> Gtk.ResponseType:
+        """The response type of the response that occurred; initially this is NONE.
+        Use the GTK response() method to artificially generate a response, rather than
+        setting this."""
+        return self._response_type
 
-    def add_styled_button(self, button_text, response_id, css_class):
+    @property
+    def confirmed(self) -> bool:
+        """True if 'response_type' is OK or YES."""
+        return self.response_type in (Gtk.ResponseType.OK, Gtk.ResponseType.YES)
+
+    def on_response(self, _dialog, response: Gtk.ResponseType) -> None:
+        """Handles the dialog response; you can override this but by default
+        this records the response for 'response_type'."""
+        self._response_type = response
+
+    def destroy_at_idle(self, condition: Callable = None):
+        """Adds as idle task to destroy this window at idle time;
+        it can do so conditionally if you provide a callable to check,
+        but it checks only once. You can still explicitly destroy the
+        dialog after calling this. This is used to ensure destruction of
+        ModalDialog after run()."""
+
+        def idle_destroy():
+            nonlocal idle_source_id
+            idle_source_id = None
+            if not condition or condition():
+                self.destroy()
+            return False
+
+        def on_destroy(*_args):
+            nonlocal idle_source_id
+            self.disconnect(on_destroy_id)
+            if idle_source_id:
+                GLib.source_remove(idle_source_id)
+            idle_source_id = None
+
+        self.hide()
+        idle_source_id = GLib.idle_add(idle_destroy)
+        on_destroy_id = self.connect("destroy", on_destroy)
+
+    def add_styled_button(self, button_text: str, response_id: Gtk.ResponseType,
+                          css_class: str):
         button = self.add_button(button_text, response_id)
         if css_class:
             style_context = button.get_style_context()
             style_context.add_class(css_class)
         return button
 
-    def add_default_button(self, button_text, response_id, css_class="suggested-action"):
+    def add_default_button(self, button_text: str, response_id: Gtk.ResponseType,
+                           css_class: str = "suggested-action"):
         """Adds a button to the dialog with a particular response id, but
         also makes it the default and styles it as the suggested action."""
         button = self.add_styled_button(button_text, response_id, css_class)
@@ -42,11 +92,25 @@ class Dialog(Gtk.Dialog):
 
 
 class ModalDialog(Dialog):
-    """A base class of modal dialogs, which sets the flag for you."""
+    """A base class of modal dialogs, which sets the flag for you.
 
-    def __init__(self, title=None, parent=None, flags=0, buttons=None, **kwargs):
+    Unlike plain Gtk.Dialog, these destroy themselves (at idle-time) after
+    you call run(), even if you forget to. They aren't meant to be reused."""
+
+    def __init__(self, title: str = None, parent: Gtk.Widget = None,
+                 flags: Gtk.DialogFlags = 0, buttons: Gtk.ButtonsType = None,
+                 **kwargs):
         super().__init__(title, parent, flags | Gtk.DialogFlags.MODAL, buttons, **kwargs)
         self.set_destroy_with_parent(True)
+
+    def on_response(self, dialog, response: Gtk.ResponseType) -> None:
+        super().on_response(dialog, response)
+        # Model dialogs do return from run() in response from respose() but the
+        # dialog is visible and locks out its parent. So we hide it. Watch out-
+        # self.destroy() changes the run() result to NONE.
+        if response != Gtk.ResponseType.NONE:
+            self.hide()
+            self.destroy_at_idle(condition=lambda: not self.get_visible())
 
 
 class ModelessDialog(Dialog):
@@ -55,7 +119,9 @@ class ModelessDialog(Dialog):
     its own window group, so it treats its own modal dialogs separately, and it resets
     its transient-for after being created."""
 
-    def __init__(self, title=None, parent=None, flags=0, buttons=None, **kwargs):
+    def __init__(self, title: str = None, parent: Gtk.Widget = None,
+                 flags: Gtk.DialogFlags = 0, buttons: Gtk.ButtonsType = None,
+                 **kwargs):
         super().__init__(title, parent, flags, buttons, **kwargs)
         # These are not stuck above the 'main' window, but can be
         # re-ordered freely.
@@ -75,12 +141,19 @@ class ModelessDialog(Dialog):
         self.set_transient_for(None)
         return False
 
+    def on_response(self, dialog, response: Gtk.ResponseType) -> None:
+        super().on_response(dialog, response)
+        # Modal dialogs self-destruct, but modeless ones must commit
+        # suicide more explicitly.
+        if response != Gtk.ResponseType.NONE:
+            self.destroy()
+
 
 class SavableModelessDialog(ModelessDialog):
     """This is a modeless dialog that has a Cancel and a Save button in the header-bar,
     with a ctrl-S keyboard shortcut to save."""
 
-    def __init__(self, title, parent=None, **kwargs):
+    def __init__(self, title: str, parent: Gtk.Widget = None, **kwargs):
         super().__init__(title, parent=parent, use_header_bar=True, **kwargs)
 
         self.cancel_button = self.add_button(_("Cancel"), Gtk.ResponseType.CANCEL)
@@ -94,12 +167,6 @@ class SavableModelessDialog(ModelessDialog):
         self.add_accel_group(self.accelerators)
         key, mod = Gtk.accelerator_parse("<Primary>s")
         self.save_button.add_accelerator("clicked", self.accelerators, key, mod, Gtk.AccelFlags.VISIBLE)
-
-        self.connect("response", self.on_response)
-
-    def on_response(self, _widget, response):
-        if response != Gtk.ResponseType.NONE:
-            self.destroy()
 
     def on_save(self, _button):
         pass
@@ -249,14 +316,16 @@ class InputDialog(ModalDialog):
         self.user_value = ""
         self.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
         self.ok_button = self.add_default_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        self.set_default_response(Gtk.ResponseType.OK)
         self.ok_button.set_sensitive(False)
         self.set_title(dialog_settings["title"])
         label = Gtk.Label(visible=True)
         label.set_markup(dialog_settings["question"])
         self.get_content_area().pack_start(label, True, True, 12)
-        self.entry = Gtk.Entry(visible=True)
+        self.entry = Gtk.Entry(visible=True, activates_default=True)
         self.entry.connect("changed", self.on_entry_changed)
         self.get_content_area().pack_start(self.entry, True, True, 12)
+        self.entry.set_text(dialog_settings.get("initial_value") or "")
 
     def on_entry_changed(self, widget):
         self.user_value = widget.get_text()
@@ -311,44 +380,6 @@ class FileDialog:
         dialog.destroy()
 
 
-class LutrisInitDialog(Gtk.Dialog):
-
-    def __init__(self, runtime_updater):
-        super().__init__()
-        self.runtime_updater = runtime_updater
-
-        self.set_icon_name("lutris")
-        self.set_size_request(320, 60)
-        self.set_border_width(24)
-        self.set_decorated(False)
-        vbox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 12)
-        self.label = Gtk.Label(_("Checking for runtime updates, please wait…"))
-        vbox.add(self.label)
-        self.progress = Gtk.ProgressBar(visible=True)
-        vbox.add(self.progress)
-        self.get_content_area().add(vbox)
-        self.progress_timeout = GLib.timeout_add(125, self.show_progress)
-        self.show_all()
-
-        self.connect("destroy", self.on_destroy)
-        AsyncCall(self.runtime_updater.update_runtimes, self.init_cb)
-
-    def show_progress(self):
-        self.progress.set_fraction(self.runtime_updater.percentage_completed())
-        if self.runtime_updater.status_text and self.label.get_text() != self.runtime_updater.status_text:
-            self.label.set_text(self.runtime_updater.status_text)
-        return True
-
-    def init_cb(self, _result, error: Exception):
-        if error:
-            ErrorDialog(error, parent=self)
-        self.destroy()
-
-    def on_destroy(self, window):
-        GLib.source_remove(self.progress_timeout)
-        return True
-
-
 class InstallOrPlayDialog(ModalDialog):
 
     def __init__(self, game_name, parent=None):
@@ -358,7 +389,6 @@ class InstallOrPlayDialog(ModalDialog):
 
         self.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
         self.add_default_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
-        self.connect("response", self.on_response)
 
         self.set_size_request(320, 120)
         vbox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 6)
@@ -379,10 +409,9 @@ class InstallOrPlayDialog(ModalDialog):
         self.action = action
 
     def on_response(self, _widget, response):
-        logger.debug("Dialog response %s", response)
         if response == Gtk.ResponseType.CANCEL:
             self.action = None
-        self.destroy()
+        super().on_response(_widget, response)
 
 
 class LaunchConfigSelectDialog(ModalDialog):
@@ -390,11 +419,9 @@ class LaunchConfigSelectDialog(ModalDialog):
         super().__init__(title=title, parent=parent, border_width=10)
         self.config_index = 0
         self.dont_show_again = False
-        self.confirmed = False
 
         self.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
         self.add_default_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
-        self.connect("response", self.on_response)
 
         self.set_size_request(320, 120)
         vbox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 6)
@@ -421,10 +448,6 @@ class LaunchConfigSelectDialog(ModalDialog):
 
     def on_dont_show_checkbutton_toggled(self, _button):
         self.dont_show_again = _button.get_active()
-
-    def on_response(self, _widget, response):
-        self.confirmed = response == Gtk.ResponseType.OK
-        self.destroy()
 
 
 class ClientLoginDialog(GtkBuilderDialog):
@@ -483,7 +506,6 @@ class InstallerSourceDialog(ModelessDialog):
 
         ok_button = self.add_default_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
         ok_button.set_border_width(10)
-        self.connect("response", self.on_response)
 
         self.scrolled_window = Gtk.ScrolledWindow()
         self.scrolled_window.set_hexpand(True)
@@ -499,39 +521,6 @@ class InstallerSourceDialog(ModelessDialog):
         self.scrolled_window.add(source_box)
 
         self.show_all()
-
-    def on_response(self, *args):
-        self.destroy()
-
-
-class WarningMessageDialog(Gtk.MessageDialog):
-    def __init__(self, message, secondary_message="", parent=None):
-        super().__init__(type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.OK, parent=parent)
-
-        self.set_default_response(Gtk.ResponseType.OK)
-        self.set_markup("<b>%s</b>" % message)
-        if secondary_message:
-            self.props.secondary_use_markup = True
-            self.props.secondary_text = secondary_message
-        self.run()
-        self.destroy()
-
-
-class WineNotInstalledWarning(WarningMessageDialog):
-    """Display a warning if Wine is not detected on the system"""
-
-    def __init__(self, parent=None, cancellable=False):
-        super().__init__(
-            _("Wine is not installed on your system."),
-            secondary_message=_(
-                "Having Wine installed on your system guarantees that "
-                "Wine builds from Lutris will have all required dependencies.\n\nPlease "
-                "follow the instructions given in the <a "
-                "href='https://github.com/lutris/docs/blob/master/WineDependencies.md'>Lutris Wiki</a> to "
-                "install Wine."
-            ),
-            parent=parent
-        )
 
 
 class MoveDialog(ModelessDialog):
@@ -555,22 +544,42 @@ class MoveDialog(ModelessDialog):
         self.progress.set_pulse_step(0.1)
         vbox.add(self.progress)
         self.get_content_area().add(vbox)
-        GLib.timeout_add(125, self.show_progress)
+        self.progress_source_id = GLib.timeout_add(125, self.show_progress)
+        self.connect("destroy", self.on_destroy)
         self.show_all()
 
+    def on_destroy(self, _dialog):
+        GLib.source_remove(self.progress_source_id)
+
     def move(self):
-        AsyncCall(self._move_game, self.on_game_moved)
+        AsyncCall(self._move_game, self._move_game_cb)
 
     def show_progress(self):
         self.progress.pulse()
         return True
 
     def _move_game(self):
-        self.new_directory = self.game.move(self.destination)
+        # not safe fire a signal from a thread- it will surely hit GTK and may crash
+        self.new_directory = self.game.move(self.destination, no_signal=True)
+
+    def _move_game_cb(self, _result, error):
+        if error and isinstance(error, InvalidGameMoveError):
+            secondary = _("Do you want to change the game location anyway? No files can be moved, "
+                          "and the game configuration may need to be adjusted.")
+            dlg = WarningDialog(str(error), secondary=secondary, parent=self)
+            if dlg.result == Gtk.ResponseType.OK:
+                self.new_directory = self.game.set_location(self.destination)
+                self.on_game_moved(None, None)
+            else:
+                self.destroy()
+            return
+
+        self.on_game_moved(_result, error)
 
     def on_game_moved(self, _result, error):
         if error:
             ErrorDialog(error, parent=self)
+        self.game.emit("game-updated")  # because we could not fire this on the thread
         self.emit("game-moved")
         self.destroy()
 
@@ -581,7 +590,6 @@ class HumbleBundleCookiesDialog(ModalDialog):
         self.cookies_content = None
         self.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
         self.add_default_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
-        self.connect("response", self.on_response)
 
         self.set_size_request(640, 512)
 
@@ -616,10 +624,11 @@ class HumbleBundleCookiesDialog(ModalDialog):
         self.show_all()
         self.run()
 
-    def on_response(self, _widget, response):
+    def on_response(self, dialog, response):
         if response == Gtk.ResponseType.CANCEL:
             self.cookies_content = None
         else:
             buffer = self.textview.get_buffer()
             self.cookies_content = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
-        self.destroy()
+
+        super().on_response(dialog, response)

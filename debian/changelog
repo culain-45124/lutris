@@ -1,3 +1,40 @@
+lutris (0.5.16) jammy; urgency=medium
+
+  * Fix bug that prevented installers to complete
+  * Better handling of Steam configurations for the Steam account picker
+  * Load game library in a background thread
+
+ -- Mathieu Comandon <mathieucomandon@gmail.com>  Mon, 15 Jan 2024 16:10:35 -0800
+
+lutris (0.5.15) jammy; urgency=medium
+
+  * Fix some crashes happening when using Wayland and a high DPI gaming mouse
+  * Fix crash when opening the system preferences tab for a game
+  * Reduced the locales list to a predefined one (let us know if you need yours added)
+  * Fix Lutris not expanding "~" in paths
+  * Download runtime components from the main window,
+    the "updating runtime" dialog appearing before Lutris opens has been removed
+  * Add the ability to open a location in your file browser from file picker widgets
+  * Add the ability to select, remove, or stop multiple games in the Lutris window
+  * Redesigned 'Uninstall Game' dialog now completely removes games by default
+  * Fix the export / import feature
+  * Show an animation when a game is launched
+  * Add the ability to disable Wine auto-updates at the expense of losing support
+  * Add playtime editing in the game preferences
+  * Move game files, runners to the trash instead of deleting them they are uninstalled
+  * Add "Updates" tab in Preferences control and check for updates and correct missing media
+    in the 'Games' view.
+  * Add "Storage" tab in Preferences to control game and installer cache location
+  * Expand "System" tab in Preferences with more system information but less brown.
+  * Add "Run Task Manager" command for Wine games
+  * Add two new, smaller banner sizes for itch.io games.
+  * Ignore Wine virtual desktop setting when using Wine-GE/Proton to avoid crash
+  * Ignore MangoHUD setting when launching Steam to avoid crash
+  * Sync Steam playtimes with the Lutris library
+
+
+ -- Mathieu Comandon <mathieucomandon@gmail.com>  Sun, 07 Jan 2024 17:29:46 -0800
+
 lutris (0.5.14) jammy; urgency=medium
 
   * Add Steam account switcher to handle multiple Steam accounts

@@ -9,6 +9,7 @@ import signal
 import subprocess
 import time
 from gettext import gettext as _
+from typing import cast
 
 from gi.repository import GLib, GObject, Gtk
 
@@ -18,18 +19,20 @@ from lutris.config import LutrisConfig
 from lutris.database import categories as categories_db
 from lutris.database import games as games_db
 from lutris.database import sql
-from lutris.exceptions import GameConfigError, watch_game_errors
+from lutris.exception_backstops import watch_game_errors
+from lutris.exceptions import GameConfigError, InvalidGameMoveError, MissingExecutableError
 from lutris.runner_interpreter import export_bash_script, get_launch_parameters
-from lutris.runners import InvalidRunner, import_runner
+from lutris.runners import InvalidRunnerError, import_runner
+from lutris.runners.runner import Runner
 from lutris.util import audio, discord, extract, jobs, linux, strings, system, xdgshortcuts
 from lutris.util.display import (
     DISPLAY_MANAGER, SCREEN_SAVER_INHIBITOR, disable_compositing, enable_compositing, restore_gamma
 )
 from lutris.util.graphics.xephyr import get_xephyr_command
 from lutris.util.graphics.xrandr import turn_off_except
+from lutris.util.linux import LINUX_SYSTEM
 from lutris.util.log import LOG_BUFFERS, logger
 from lutris.util.process import Process
-from lutris.util.savesync import sync_saves
 from lutris.util.steam.shortcut import remove_shortcut as remove_steam_shortcut
 from lutris.util.timer import Timer
 from lutris.util.yaml import write_yaml_to_file
@@ -68,9 +71,9 @@ class Game(GObject.Object):
         "game-installed": (GObject.SIGNAL_RUN_FIRST, None, ()),
     }
 
-    def __init__(self, game_id=None):
+    def __init__(self, game_id: str = None):
         super().__init__()
-        self._id = game_id  # pylint: disable=invalid-name
+        self._id = str(game_id) if game_id else None  # pylint: disable=invalid-name
 
         # Load attributes from database
         game_data = games_db.get_game_by_field(game_id, "id")
@@ -124,7 +127,8 @@ class Game(GObject.Object):
         has an 'appid' and slug."""
         game = Game()
         game.name = db_game["name"]
-        game.slug = db_game["slug"]
+        game.slug = service.get_installed_slug(db_game)
+        game.runner_name = service.get_installed_runner_name(db_game)
 
         if "service_id" in db_game:
             game.appid = db_game["service_id"]
@@ -146,26 +150,26 @@ class Game(GObject.Object):
     @property
     def is_cache_managed(self):
         """Is the DXVK cache receiving updates from lutris?"""
-        if self.runner:
+        try:
+            if not self.has_runner:
+                return False
+
             env = self.runner.system_config.get("env", {})
             return "DXVK_STATE_CACHE_PATH" in env
-        return False
+        except InvalidRunnerError as ex:
+            logger.exception("Unable to query runner configuration: %s", ex)
+            return False
 
     @property
-    def id(self):
-        if self._id is None:
+    def id(self) -> str:
+        if not self._id:
             logger.error("The game '%s' has no ID, it is not stored in the PGA.", self.name)
-        return self._id
-
-    def get_safe_id(self):
-        """Returns the ID, or None if this Game has not got one; use this
-        rather than 'id' if your code expects to cope with the None."""
-        return self._id
+        return cast(str, self._id)
 
     @property
-    def is_db_stored(self):
+    def is_db_stored(self) -> bool:
         """True if this Game has an ID, which means it is saved in the PGA."""
-        return self._id is not None
+        return bool(self._id)
 
     @property
     def is_updatable(self):
@@ -193,7 +197,7 @@ class Game(GObject.Object):
 
     def add_category(self, category_name, no_signal=False):
         """add game to category"""
-        if self.id is None:
+        if not self.is_db_stored:
             raise RuntimeError("Games that do not have IDs cannot belong to categories.")
 
         category = categories_db.get_category(category_name)
@@ -240,12 +244,11 @@ class Game(GObject.Object):
         """Do not show this game in the UI"""
         self.is_hidden = is_hidden
         self.save()
-        self.emit("game-updated")
 
     @property
     def log_buffer(self):
         """Access the log buffer object, creating it if necessary"""
-        _log_buffer = LOG_BUFFERS.get(str(self.id))
+        _log_buffer = LOG_BUFFERS.get(self.id)
         if _log_buffer:
             return _log_buffer
         _log_buffer = Gtk.TextBuffer()
@@ -253,7 +256,7 @@ class Game(GObject.Object):
         if self.game_thread:
             self.game_thread.set_log_buffer(self._log_buffer)
             _log_buffer.set_text(self.game_thread.stdout)
-        LOG_BUFFERS[str(self.id)] = _log_buffer
+        LOG_BUFFERS[self.id] = _log_buffer
         return _log_buffer
 
     @property
@@ -273,31 +276,6 @@ class Game(GObject.Object):
         if not handled:
             self.emit("game-unhandled-error", error)
 
-    @staticmethod
-    def get_config_error(gameplay_info):
-        """Return a GameConfigError based on the runner's output."""
-        error = gameplay_info["error"]
-        if error == "CUSTOM":
-            message_text = gameplay_info["text"].replace("&", "&amp;")
-        elif error == "RUNNER_NOT_INSTALLED":
-            message_text = _("Error the runner is not installed")
-        elif error == "NO_BIOS":
-            message_text = _("A bios file is required to run this game")
-        elif error == "FILE_NOT_FOUND":
-            filename = gameplay_info["file"]
-            if filename:
-                message_text = _("The file {} could not be found").format(filename.replace("&", "&amp;"))
-            else:
-                message_text = _("This game has no executable set. The install process didn't finish properly.")
-        elif error == "NOT_EXECUTABLE":
-            file = gameplay_info["file"].replace("&", "&amp;")
-            message_text = _("The file %s is not executable") % file
-        elif error == "PATH_NOT_SET":
-            message_text = _("The path '%s' is not set. please set it in the options.") % gameplay_info["path"]
-        else:
-            message_text = _("Unhandled error: %s") % gameplay_info["error"]
-        return GameConfigError(message_text)
-
     def get_browse_dir(self):
         """Return the path to open with the Browse Files action."""
         return self.resolve_game_path()
@@ -307,7 +285,7 @@ class Game(GObject.Object):
         it. This can still return an empty string if it can't do that."""
         if self.directory:
             return os.path.expanduser(self.directory)  # expanduser just in case!
-        if self.runner:
+        if self.has_runner:
             return self.runner.resolve_game_path()
         return ""
 
@@ -333,30 +311,31 @@ class Game(GObject.Object):
         self._runner = None
 
     @property
-    def runner_name(self):
+    def runner_name(self) -> str:
         return self._runner_name
 
     @runner_name.setter
-    def runner_name(self, value):
-        self._runner_name = value
+    def runner_name(self, value: str) -> None:
+        self._runner_name = value or ""
         if self._runner and self._runner.name != value:
             self._runner = None
 
     @property
-    def runner(self):
-        if not self.runner_name:
-            return None
+    def has_runner(self) -> bool:
+        return bool(self._runner_name)
+
+    @property
+    def runner(self) -> Runner:
+        if not self.has_runner:
+            raise GameConfigError(_("Invalid game configuration: Missing runner"))
 
         if not self._runner:
-            try:
-                runner_class = import_runner(self.runner_name)
-                self._runner = runner_class(self.config)
-            except InvalidRunner:
-                logger.error("Unable to import runner %s for %s", self.runner_name, self.slug)
-        return self._runner
+            runner_class = import_runner(self.runner_name)
+            self._runner = runner_class(self.config)
+        return cast(Runner, self._runner)
 
     @runner.setter
-    def runner(self, value):
+    def runner(self, value: Runner) -> None:
         self._runner = value
         if value:
             self._runner_name = value.name
@@ -372,19 +351,32 @@ class Game(GObject.Object):
                 disable_compositing()
                 self.compositor_disabled = True
 
-    def remove(self, delete_files=False, no_signal=False):
-        """Uninstall a game
+    def remove(self, delete_files: bool = False, no_signal: bool = False) -> None:
+        """Uninstall a game, and removes it from the library if this it has no playtime.
 
         Params:
             delete_files (bool): Delete the game files
-            no_signal (bool): Don't emit game-removed signal (if running in a thread)
+            no_signal (bool): Don't emit game-removed signal
+        """
+        if self.playtime:
+            self.uninstall(delete_files=delete_files, no_signal=no_signal)
+        else:
+            self.uninstall(delete_files=delete_files, no_signal=True)
+            self.delete(no_signal=no_signal)
+
+    def uninstall(self, delete_files: bool = False, no_signal: bool = False) -> None:
+        """Uninstall a game, but do not remove it from the library.
+
+        Params:
+            delete_files (bool): Delete the game files
+            no_signal (bool): Don't emit game-removed signal
         """
         sql.db_update(settings.PGA_DB, "games", {"installed": 0, "runner": ""}, {"id": self.id})
         if self.config:
             self.config.remove()
         xdgshortcuts.remove_launcher(self.slug, self.id, desktop=True, menu=True)
         remove_steam_shortcut(self)
-        if delete_files and self.runner:
+        if delete_files and self.has_runner:
             # self.directory here, not self.resolve_game_path; no guessing at
             # directories when we delete them
             self.runner.remove_game_data(app_id=self.appid, game_path=self.directory)
@@ -392,18 +384,15 @@ class Game(GObject.Object):
         self._config = None
         self._runner = None
 
-        if str(self.id) in LOG_BUFFERS:  # Reset game logs on removal
-            log_buffer = LOG_BUFFERS[str(self.id)]
+        if self.id in LOG_BUFFERS:  # Reset game logs on removal
+            log_buffer = LOG_BUFFERS[self.id]
             log_buffer.delete(log_buffer.get_start_iter(), log_buffer.get_end_iter())
 
-        if not self.playtime:
-            return self.delete(no_signal=no_signal)
-        if no_signal:
-            return
-        self.emit("game-removed")
+        if not no_signal:
+            self.emit("game-removed")
 
-    def delete(self, no_signal=False):
-        """Completely remove a game from the library"""
+    def delete(self, no_signal: bool = False) -> None:
+        """Delete a game from the library; must be uninstalled first."""
         if self.is_installed:
             raise RuntimeError(_("Uninstall the game before deleting"))
         games_db.delete_game(self.id)
@@ -413,14 +402,14 @@ class Game(GObject.Object):
 
     def set_platform_from_runner(self):
         """Set the game's platform from the runner"""
-        if not self.runner:
+        if not self.has_runner:
             logger.warning("Game has no runner, can't set platform")
             return
         self.platform = self.runner.get_platform()
         if not self.platform:
             logger.warning("The %s runner didn't provide a platform for %s", self.runner.human_name, self)
 
-    def save(self):
+    def save(self, no_signal=False):
         """
         Save the game's config and metadata.
         """
@@ -454,8 +443,9 @@ class Game(GObject.Object):
             "has_custom_icon": "icon" in self.custom_images,
             "has_custom_coverart_big": "coverart_big" in self.custom_images
         }
-        self._id = games_db.add_or_update(**game_data)
-        self.emit("game-updated")
+        self._id = str(games_db.add_or_update(**game_data))
+        if not no_signal:
+            self.emit("game-updated")
 
     def save_platform(self):
         """Save only the platform field- do not restore any other values the user may have changed
@@ -479,7 +469,7 @@ class Game(GObject.Object):
         if not self.is_installed or not self.is_db_stored:
             logger.error("%s (%s) not installed", self, self.id)
             raise GameConfigError(_("Tried to launch a game that isn't installed."))
-        if not self.runner:
+        if not self.has_runner:
             raise GameConfigError(_("Invalid game configuration: Missing runner"))
 
         return True
@@ -511,7 +501,7 @@ class Game(GObject.Object):
 
     def start_xephyr(self, display=":2"):
         """Start a monitored Xephyr instance"""
-        if not system.find_executable("Xephyr"):
+        if not system.can_find_executable("Xephyr"):
             raise GameConfigError(_("Unable to find Xephyr, install it or disable the Xephyr option"))
         xephyr_command = get_xephyr_command(display, self.runner.system_config)
         xephyr_thread = MonitoredCommand(xephyr_command)
@@ -521,12 +511,18 @@ class Game(GObject.Object):
 
     def start_antimicrox(self, antimicro_config):
         """Start Antimicrox with a given config path"""
-        antimicro_path = system.find_executable("antimicrox")
-        if not antimicro_path:
-            logger.warning("Antimicrox is not installed.")
-            return
-        logger.info("Starting Antic")
-        antimicro_command = [antimicro_path, "--hidden", "--tray", "--profile", antimicro_config]
+        if LINUX_SYSTEM.is_flatpak():
+            antimicro_command = ["flatpak-spawn", "--host", "antimicrox"]
+        else:
+            try:
+                antimicro_command = [system.find_executable("antimicrox")]
+            except MissingExecutableError as ex:
+                raise GameConfigError(
+                    _("Unable to find Antimicrox, install it or disable the Antimicrox option")
+                ) from ex
+
+        logger.info("Starting Antimicro")
+        antimicro_command += ["--hidden", "--tray", "--profile", antimicro_config]
         self.antimicro_thread = MonitoredCommand(antimicro_command)
         self.antimicro_thread.start()
 
@@ -558,7 +554,7 @@ class Game(GObject.Object):
         """
         if self.runner.system_config.get("terminal"):
             terminal = self.runner.system_config.get("terminal_app", linux.get_default_terminal())
-            if terminal and not system.find_executable(terminal):
+            if terminal and not system.can_find_executable(terminal):
                 raise GameConfigError(_("The selected terminal application could not be launched:\n%s") % terminal)
             return terminal
 
@@ -582,11 +578,7 @@ class Game(GObject.Object):
         in which case the game should not be run.
         """
 
-        if not self.runner:
-            raise GameConfigError(_("Invalid game configuration: Missing runner"))
         gameplay_info = self.runner.play()
-        if "error" in gameplay_info:
-            raise self.get_config_error(gameplay_info)
 
         if "working_dir" not in gameplay_info:
             gameplay_info["working_dir"] = self.runner.working_dir
@@ -676,12 +668,9 @@ class Game(GObject.Object):
             return False
 
         self.reload_config()  # Reload the config before launching it.
-        saves = self.config.game_level["game"].get("saves")
-        if saves:
-            sync_saves(self)
 
-        if str(self.id) in LOG_BUFFERS:  # Reset game logs on each launch
-            log_buffer = LOG_BUFFERS[str(self.id)]
+        if self.id in LOG_BUFFERS:  # Reset game logs on each launch
+            log_buffer = LOG_BUFFERS[self.id]
             log_buffer.delete(log_buffer.get_start_iter(), log_buffer.get_end_iter())
 
         self.state = self.STATE_LAUNCHING
@@ -703,7 +692,7 @@ class Game(GObject.Object):
         return True
 
     def start_game(self):
-        """Run a background command to lauch the game"""
+        """Run a background command to launch the game"""
         self.game_thread = MonitoredCommand(
             self.game_runtime_config["args"],
             title=self.name,
@@ -736,30 +725,40 @@ class Game(GObject.Object):
 
     def force_stop(self):
         # If force_stop_game fails, wait a few seconds and try SIGKILL on any survivors
-        self.runner.force_stop_game(self)
-        if self.get_stop_pids():
-            self.force_kill_delayed()
-        else:
-            self.stop_game()
+
+        def force_stop_game():
+            self.runner.force_stop_game(self)
+            return not self.get_stop_pids()
+
+        def force_stop_game_cb(all_dead, error):
+            if error:
+                self.signal_error(error)
+            elif all_dead:
+                self.stop_game()
+            else:
+                self.force_kill_delayed()
+
+        jobs.AsyncCall(force_stop_game, force_stop_game_cb)
 
     def force_kill_delayed(self, death_watch_seconds=5, death_watch_interval_seconds=.5):
         """Forces termination of a running game, but only after a set time has elapsed;
         Invokes stop_game() when the game is dead."""
 
         def death_watch():
-            """Wait for the processes to die; returns True if do they all did."""
+            """Wait for the processes to die; kill them if they do not."""
             for _n in range(int(death_watch_seconds / death_watch_interval_seconds)):
                 time.sleep(death_watch_interval_seconds)
                 if not self.get_stop_pids():
-                    return True
-            return False
+                    return
 
-        def death_watch_cb(all_died, error):
+            # Once we get past the time limit, starting killing!
+            self.kill_processes(signal.SIGKILL)
+
+        def death_watch_cb(_result, error):
             """Called after the death watch to more firmly kill any survivors."""
             if error:
                 self.signal_error(error)
-            elif not all_died:
-                self.kill_processes(signal.SIGKILL)
+
             # If we still can't kill everything, we'll still say we stopped it.
             self.stop_game()
 
@@ -781,7 +780,8 @@ class Game(GObject.Object):
         """Finds the PIDs of processes that need killin'!"""
         pids = self.get_game_pids()
         if self.game_thread and self.game_thread.game_process:
-            pids.add(self.game_thread.game_process.pid)
+            if self.game_thread.game_process.poll() is None:
+                pids.add(self.game_thread.game_process.pid)
         return pids
 
     def get_game_pids(self):
@@ -791,18 +791,20 @@ class Game(GObject.Object):
             return set()
 
         new_pids = self.get_new_pids()
-        game_pids = []
+
         game_folder = self.resolve_game_path()
+        folder_pids = set()
         for pid in new_pids:
             cmdline = Process(pid).cmdline or ""
             # pressure-vessel: This could potentially pick up PIDs not started by lutris?
             if game_folder in cmdline or "pressure-vessel" in cmdline:
-                game_pids.append(pid)
+                folder_pids.add(pid)
 
-        return set(game_pids + [
+        uuid_pids = set(
             pid for pid in new_pids
-            if Process(pid).environ.get("LUTRIS_GAME_UUID") == self.game_uuid
-        ])
+            if Process(pid).environ.get("LUTRIS_GAME_UUID") == self.game_uuid)
+
+        return folder_pids & uuid_pids
 
     def get_new_pids(self):
         """Return list of PIDs started since the game was launched"""
@@ -862,7 +864,7 @@ class Game(GObject.Object):
         logger.info("Stopping %s", self)
 
         if self.game_thread:
-            def stop_cb(result, error):
+            def stop_cb(_result, error):
                 if error:
                     self.signal_error(error)
 
@@ -936,14 +938,14 @@ class Game(GObject.Object):
         if self.game_thread.return_code == 127:
             # Error missing shared lib
             error = "error while loading shared lib"
-            error_line = strings.lookup_string_in_text(error, self.game_thread.stdout)
-            if error_line:
-                raise RuntimeError(_("<b>Error: Missing shared library.</b>\n\n%s") % error_line)
+            error_lines = strings.lookup_strings_in_text(error, self.game_thread.stdout)
+            if error_lines:
+                raise RuntimeError(_("<b>Error: Missing shared library.</b>\n\n%s") % error_lines[0])
 
         if self.game_thread.return_code == 1:
             # Error Wine version conflict
             error = "maybe the wrong wineserver"
-            if strings.lookup_string_in_text(error, self.game_thread.stdout):
+            if strings.lookup_strings_in_text(error, self.game_thread.stdout):
                 raise RuntimeError(_("<b>Error: A different Wine version is already using the same Wine prefix.</b>"))
 
     def write_script(self, script_path, launch_ui_delegate):
@@ -954,20 +956,26 @@ class Game(GObject.Object):
             return
         export_bash_script(self.runner, gameplay_info, script_path)
 
-    def move(self, new_location):
+    def move(self, new_location, no_signal=False):
         logger.info("Moving %s to %s", self, new_location)
         new_config = ""
         old_location = self.directory
-        if os.path.exists(old_location):
-            game_directory = os.path.basename(old_location)
-            target_directory = os.path.join(new_location, game_directory)
-        else:
-            target_directory = new_location
-        self.directory = target_directory
-        self.save()
+        target_directory = self._get_move_target_directory(new_location)
+
+        # Raise errors before actually changing anything!
         if not old_location:
-            logger.info("Previous location wasn't set. Cannot continue moving")
-            return target_directory
+            raise InvalidGameMoveError(_("The game has no location currently set, so it can't be moved."))
+
+        if not system.path_exists(old_location):
+            raise InvalidGameMoveError(
+                _("The location '%s' does not exist, perhaps the files have already been moved?") % old_location)
+
+        if new_location.startswith(old_location):
+            raise InvalidGameMoveError(
+                _("Lutris can't move '%s' to a location inside of itself, '%s'.") % (old_location, new_location))
+
+        self.directory = target_directory
+        self.save(no_signal=no_signal)
 
         with open(self.config.game_config_path, encoding='utf-8') as config_file:
             for line in config_file.readlines():
@@ -978,12 +986,6 @@ class Game(GObject.Object):
         with open(self.config.game_config_path, "w", encoding='utf-8') as config_file:
             config_file.write(new_config)
 
-        if not system.path_exists(old_location):
-            logger.warning("Location %s doesn't exist, files already moved?", old_location)
-            return target_directory
-        if new_location.startswith(old_location):
-            logger.warning("Can't move %s to one of its children %s", old_location, new_location)
-            return target_directory
         try:
             shutil.move(old_location, new_location)
         except OSError as ex:
@@ -992,6 +994,20 @@ class Game(GObject.Object):
                 old_location, new_location, ex
             )
         return target_directory
+
+    def set_location(self, new_location):
+        target_directory = self._get_move_target_directory(new_location)
+        self.directory = target_directory
+        self.save()
+        return target_directory
+
+    def _get_move_target_directory(self, new_location):
+        old_location = self.directory
+        if old_location and os.path.exists(old_location):
+            game_directory = os.path.basename(old_location)
+            return os.path.join(new_location, game_directory)
+
+        return new_location
 
 
 def export_game(slug, dest_dir):
@@ -1007,6 +1023,9 @@ def export_game(slug, dest_dir):
         "scummvm",
     ]
     db_game = games_db.get_game_by_field(slug, "slug")
+    if not db_game:
+        logger.error("Game %s not found", slug)
+        return
     if db_game["runner"] not in exportable_runners:
         raise RuntimeError("Game %s can't be exported." % db_game["name"])
     if not db_game["directory"]:
@@ -1018,26 +1037,33 @@ def export_game(slug, dest_dir):
     config_path = os.path.join(db_game["directory"], "%s.lutris" % slug)
     with open(config_path, "w", encoding="utf-8") as config_file:
         json.dump(db_game, config_file, indent=2)
-    archive_path = os.path.join(dest_dir, "%s.7z" % slug)
-    _7zip_path = os.path.join(settings.RUNTIME_DIR, "p7zip/7z")
-    command = [_7zip_path, "a", archive_path, game_path]
-    return_code = subprocess.call(command)
-    if return_code != 0:
-        print("Creating of archive in %s failed with return code %s" % (archive_path, return_code))
+    archive_path = os.path.join(dest_dir, "%s.tar.xz" % slug)
+    command = ["tar", "cJf", archive_path, os.path.basename(game_path)]
+    system.execute(
+        command,
+        cwd=os.path.dirname(game_path)
+    )
+    logger.info("%s exported to %s", slug, archive_path)
 
 
 def import_game(file_path, dest_dir):
     """Import a game in Lutris"""
     if not os.path.exists(file_path):
         raise RuntimeError("No file %s" % file_path)
+    logger.info("Importing %s to %s", file_path, dest_dir)
     if not os.path.isdir(dest_dir):
         os.makedirs(dest_dir)
     original_file_list = set(os.listdir(dest_dir))
-    extract.extract_7zip(file_path, dest_dir)
+    extract.extract_archive(file_path, dest_dir, merge_single=False)
     new_file_list = set(os.listdir(dest_dir))
     new_dir = list(new_file_list - original_file_list)[0]
     game_dir = os.path.join(dest_dir, new_dir)
-    game_config = [f for f in os.listdir(game_dir) if f.endswith(".lutris")][0]
+    try:
+        game_config = [f for f in os.listdir(game_dir) if f.endswith(".lutris")][0]
+    except IndexError:
+        logger.error("No Lutris configuration file found in archive")
+        return
+
     with open(os.path.join(game_dir, game_config), encoding="utf-8") as config_file:
         lutris_config = json.load(config_file)
     old_dir = lutris_config["directory"]
@@ -1050,7 +1076,7 @@ def import_game(file_path, dest_dir):
         lutris_config = json.load(config_file)
     config_filename = os.path.join(settings.CONFIG_DIR, "games/%s.yml" % lutris_config["configpath"])
     write_yaml_to_file(lutris_config["config"], config_filename)
-    game_id = games_db.add_or_update(
+    game_id = games_db.add_game(
         name=lutris_config["name"],
         runner=lutris_config["runner"],
         slug=lutris_config["slug"],

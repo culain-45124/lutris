@@ -42,6 +42,7 @@ class LutrisInstaller:  # pylint: disable=too-many-instance-attributes
             for file_id, file_meta in file_desc.items()
         ]
         self.files = []
+        self.extra_file_paths = []
         self.requires = self.script.get("requires")
         self.extends = self.script.get("extends")
         self.game_id = self.get_game_id()
@@ -147,7 +148,7 @@ class LutrisInstaller:  # pylint: disable=too-many-instance-attributes
             errors.append("Scripts can't have both extends and requires")
         return errors
 
-    def prepare_game_files(self, patch_version=None):
+    def prepare_game_files(self, extras, patch_version=None):
         """Gathers necessary files before iterating through them."""
         if not self.script_files:
             return
@@ -159,39 +160,59 @@ class LutrisInstaller:  # pylint: disable=too-many-instance-attributes
                 if file.url.startswith("N/A"):
                     installer_file_id = file.id
                     installer_file_url = file.url
-        self.files = [file.copy() for file in self.script_files if file.id != installer_file_id]
+                    break
+        files = [file.copy() for file in self.script_files if file.id != installer_file_id]
+        extra_file_paths = []
 
         # Run variable substitution on the URLs from the script
-        for file in self.files:
+        for file in files:
             file.set_url(self.interpreter._substitute(file.url))
             if is_moddb_url(file.url):
                 file.set_url(ModDB().transform_url(file.url))
 
         if installer_file_id and self.service:
             logger.info("Getting files for %s", installer_file_id)
-            if self.service.has_extras:
-                logger.info("Adding selected extras to downloads")
-                self.service.selected_extras = self.interpreter.extras
             try:
                 if patch_version:
                     # If a patch version is given download the patch files instead of the installer
                     installer_files = self.service.get_patch_files(self, installer_file_id)
                 else:
-                    installer_files = self.service.get_installer_files(self, installer_file_id, self.interpreter.extras)
+                    content_files, extra_files = self.service.get_installer_files(self, installer_file_id, extras)
+                    extra_file_paths = [path for f in extra_files for path in f.get_dest_files_by_id().values()]
+                    installer_files = content_files + extra_files
             except UnavailableGameError as ex:
                 logger.error("Game not available: %s", ex)
                 installer_files = None
 
             if installer_files:
                 for installer_file in installer_files:
-                    self.files.append(installer_file)
+                    files.append(installer_file)
             else:
                 # Failed to get the service game, put back a user provided file
                 logger.debug("Unable to get files from service. Setting %s to manual.", installer_file_id)
-                self.files.insert(0, InstallerFile(self.game_slug, installer_file_id, {
+                files.insert(0, InstallerFile(self.game_slug, installer_file_id, {
                     "url": installer_file_url,
                     "filename": ""
                 }))
+
+        # Commit changes only at the end; this is more robust in this method is runner
+        # my two threads concurrently- the GIL can probably save us. It's not desirable
+        # to do this, but this is the easiest workaround.
+        self.files = files
+        self.extra_file_paths = extra_file_paths
+
+    def install_extras(self):
+        # Copy extras to game folder; this updates the installer script, so it needs
+        # be called just once, before launching the installers commands.
+        if self.extra_file_paths and len(self.extra_file_paths) == len(self.files):
+            # Reset the install script in case there are only extras.
+            logger.warning("Installer with only extras and no game files")
+            self.script["installer"] = []
+
+        for extra_file in self.extra_file_paths:
+            self.script["installer"].append(
+                {"copy": {"src": extra_file, "dst": "$GAMEDIR/extras"}}
+            )
 
     def _substitute_config(self, script_config):
         """Substitute values such as $GAMEDIR in a config dict."""
@@ -332,7 +353,7 @@ class LutrisInstaller:  # pylint: disable=too-many-instance-attributes
             if launcher_value in game_files:
                 launcher_value = game_files[launcher_value]
             elif self.interpreter.target_path and os.path.exists(
-                    os.path.join(self.interpreter.target_path, launcher_value)
+                os.path.join(self.interpreter.target_path, launcher_value)
             ):
                 launcher_value = os.path.join(self.interpreter.target_path, launcher_value)
         return launcher, launcher_value

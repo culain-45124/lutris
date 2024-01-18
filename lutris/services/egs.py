@@ -12,8 +12,8 @@ from lutris.database.games import add_game, get_game_by_field
 from lutris.database.services import ServiceGameCollection
 from lutris.game import Game
 from lutris.gui.widgets.utils import Image, paste_overlay, thumbnail_image
-from lutris.installer import get_installers
-from lutris.services.base import AuthTokenExpired, OnlineService
+from lutris.services.base import AuthTokenExpiredError, OnlineService
+from lutris.services.lutris import sync_media
 from lutris.services.service_game import ServiceGame
 from lutris.services.service_media import ServiceMedia
 from lutris.util import system
@@ -50,11 +50,15 @@ class DieselGameMedia(ServiceMedia):
             logo_image = logo_image.convert("RGBA")
             logo_width, logo_height = logo_image.size
             if logo_width > self.min_logo_x:
-                logo_image = logo_image.resize((self.min_logo_x, int(
-                    logo_height * (self.min_logo_x / logo_width))), resample=Image.BICUBIC)
+                logo_image = logo_image.resize(
+                    (self.min_logo_x, int(logo_height * (self.min_logo_x / logo_width))),
+                    resample=Image.Resampling.BICUBIC
+                )
             elif logo_height > self.min_logo_y:
                 logo_image = logo_image.resize(
-                    (int(logo_width * (self.min_logo_y / logo_height)), self.min_logo_y), resample=Image.BICUBIC)
+                    (int(logo_width * (self.min_logo_y / logo_height)), self.min_logo_y),
+                    resample=Image.Resampling.BICUBIC
+                )
             thumb_image = paste_overlay(thumb_image, logo_image)
         thumb_path = os.path.join(self.dest_path, filename)
         thumb_image = thumb_image.convert("RGB")
@@ -309,7 +313,7 @@ class EpicGamesStoreService(OnlineService):
             library = self.get_library()
         except Exception as ex:  # pylint=disable:broad-except
             logger.warning("EGS Token expired")
-            raise AuthTokenExpired from ex
+            raise AuthTokenExpiredError("EGS Token expired") from ex
         egs_games = []
         for game in library:
             egs_game = EGSGame.new_from_api(game)
@@ -332,10 +336,11 @@ class EpicGamesStoreService(OnlineService):
         game_config = LutrisConfig(game_config_id=egs_game["configpath"]).game_level
         game_config["game"]["args"] = get_launch_arguments(app_name)
         configpath = write_game_config(lutris_game_id, game_config)
-        game_id = add_game(
+        slug = self.get_installed_slug(egs_game)
+        add_game(
             name=service_game["name"],
             runner=egs_game["runner"],
-            slug=slugify(service_game["name"]),
+            slug=slug,
             directory=egs_game["directory"],
             installed=1,
             installer_slug=lutris_game_id,
@@ -343,7 +348,7 @@ class EpicGamesStoreService(OnlineService):
             service=self.id,
             service_id=app_name,
         )
-        return game_id
+        return slug
 
     def add_installed_games(self):
         """Scan an existing EGS install for games"""
@@ -358,8 +363,12 @@ class EpicGamesStoreService(OnlineService):
             logger.error("Invalid install of EGS at %s", egs_prefix)
             return
         egs_launcher = EGSLauncher(egs_prefix)
+        installed_slugs = []
         for manifest in egs_launcher.iter_manifests():
-            self.install_from_egs(egs_game, manifest)
+            slug = self.install_from_egs(egs_game, manifest)
+            if slug:
+                installed_slugs.append(slug)
+        sync_media(installed_slugs)
         logger.debug("All EGS games imported")
 
     def generate_installer(self, db_game, egs_db_game):
@@ -371,8 +380,8 @@ class EpicGamesStoreService(OnlineService):
             "name": db_game["name"],
             "version": self.name,
             "slug": slugify(db_game["name"]) + "-" + self.id,
-            "game_slug": slugify(db_game["name"]),
-            "runner": self.runner,
+            "game_slug": self.get_installed_slug(db_game),
+            "runner": self.get_installed_runner_name(db_game),
             "appid": db_game["appid"],
             "script": {
                 "requires": self.client_installer,
@@ -395,15 +404,15 @@ class EpicGamesStoreService(OnlineService):
             }
         }
 
+    def get_installed_runner_name(self, db_game):
+        return self.runner
+
     def install(self, db_game):
         egs_game = get_game_by_field(self.client_installer, "slug")
         application = Gio.Application.get_default()
         if not egs_game or not egs_game["installed"]:
             logger.warning("EGS (%s) not installed", self.client_installer)
-            installers = get_installers(
-                game_slug=self.client_installer,
-            )
-            application.show_installer_window(installers)
+            application.show_lutris_installer_window(game_slug=self.client_installer)
         else:
             application.show_installer_window(
                 [self.generate_installer(db_game, egs_game)],

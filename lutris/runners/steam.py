@@ -3,7 +3,7 @@ import os
 from gettext import gettext as _
 
 from lutris.command import MonitoredCommand
-from lutris.exceptions import UnavailableRunnerError
+from lutris.exceptions import MissingGameExecutableError, UnavailableRunnerError
 from lutris.runners import NonInstallableRunnerError
 from lutris.runners.runner import Runner
 from lutris.util import linux, system
@@ -114,7 +114,7 @@ class steam(Runner):
 
     @property
     def runnable_alone(self):
-        return not linux.LINUX_SYSTEM.is_flatpak
+        return not linux.LINUX_SYSTEM.is_flatpak()
 
     @property
     def appid(self):
@@ -143,11 +143,11 @@ class steam(Runner):
         if appmanifests:
             return appmanifests[0]
 
-    def get_executable(self):
-        if linux.LINUX_SYSTEM.is_flatpak:
+    def get_executable(self) -> str:
+        if linux.LINUX_SYSTEM.is_flatpak():
             # Fallback to xgd-open for Steam URIs in Flatpak
             return system.find_executable("xdg-open")
-        if self.runner_config.get("lsi_steam") and system.find_executable("lsi-steam"):
+        if self.runner_config.get("lsi_steam") and system.can_find_executable("lsi-steam"):
             return system.find_executable("lsi-steam")
         runner_executable = self.runner_config.get("runner_executable")
         if runner_executable and os.path.isfile(runner_executable):
@@ -217,11 +217,11 @@ class steam(Runner):
         if self.game_config.get("run_without_steam") and binary_path:
             # Start without steam
             if not system.path_exists(binary_path):
-                return {"error": "FILE_NOT_FOUND", "file": binary_path}
+                raise MissingGameExecutableError(filename=binary_path)
             command = [binary_path]
         else:
             # Start through steam
-            if linux.LINUX_SYSTEM.is_flatpak:
+            if linux.LINUX_SYSTEM.is_flatpak():
                 if game_args:
                     steam_uri = "steam://run/%s//%s/" % (self.appid, game_args)
                 else:

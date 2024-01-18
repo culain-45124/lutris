@@ -11,17 +11,19 @@ from lutris.database.games import add_game, get_game_by_field
 from lutris.database.services import ServiceGameCollection
 from lutris.game import Game
 from lutris.services.base import BaseService
+from lutris.services.lutris import sync_media
 from lutris.services.service_game import ServiceGame
 from lutris.services.service_media import ServiceMedia
 from lutris.util.battlenet.definitions import ProductDbInfo
+from lutris.util.log import logger
 
 try:
     from lutris.util.battlenet.product_db_pb2 import ProductDb
-    BNET_ENABLED = True
-except (ImportError, TypeError):
-    BNET_ENABLED = False
 
-from lutris.util.log import logger
+    BNET_ENABLED = True
+except (ImportError, TypeError) as ex:
+    logger.warning("The Battle.net source is unavailable because Google protobuf could not be loaded: %s", ex)
+    BNET_ENABLED = False
 
 GAME_IDS = {
     's1': ('s1', 'StarCraft', 'S1', 'starcraft-remastered'),
@@ -117,8 +119,12 @@ class BattleNetService(BaseService):
             raise RuntimeError("Battle.net is not installed in Lutris")
         bnet_prefix = bnet_game["directory"].split("drive_c")[0]
         parser = BlizzardProductDbParser(bnet_prefix)
+        installed_slugs = []
         for game in parser.games:
-            self.install_from_battlenet(bnet_game, game)
+            slug = self.install_from_battlenet(bnet_game, game)
+            if slug:
+                installed_slugs.append(slug)
+        sync_media(installed_slugs)
 
     def install_from_battlenet(self, bnet_game, game):
         app_id = game.ngdp
@@ -134,10 +140,11 @@ class BattleNetService(BaseService):
         game_config = LutrisConfig(game_config_id=bnet_game["configpath"]).game_level
         game_config["game"]["args"] = '--exec="launch %s"' % game.ngdp
         configpath = write_game_config(lutris_game_id, game_config)
-        game_id = add_game(
+        slug = self.get_installed_slug(bnet_game)
+        add_game(
             name=service_game["name"],
             runner=bnet_game["runner"],
-            slug=service_game["slug"],
+            slug=slug,
             directory=bnet_game["directory"],
             installed=1,
             installer_slug=lutris_game_id,
@@ -146,7 +153,10 @@ class BattleNetService(BaseService):
             service_id=app_id,
             platform="Windows"
         )
-        return game_id
+        return slug
+
+    def get_installed_slug(self, db_game):
+        return db_game["slug"]
 
     def generate_installer(self, db_game, egs_db_game):
         egs_game = Game(egs_db_game["id"])
@@ -157,8 +167,8 @@ class BattleNetService(BaseService):
             "name": db_game["name"],
             "version": self.name,
             "slug": db_game["slug"] + "-" + self.id,
-            "game_slug": db_game["slug"],
-            "runner": self.runner,
+            "game_slug": self.get_installed_slug(db_game),
+            "runner": self.get_installed_runner_name(db_game),
             "appid": db_game["appid"],
             "script": {
                 "requires": self.client_installer,
@@ -180,6 +190,9 @@ class BattleNetService(BaseService):
                 ]
             }
         }
+
+    def get_installed_runner_name(self, db_game):
+        return self.runner
 
     def install(self, db_game):
         bnet_game = get_game_by_field(self.client_installer, "slug")

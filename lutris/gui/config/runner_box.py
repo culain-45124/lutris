@@ -3,9 +3,8 @@ from gettext import gettext as _
 from gi.repository import GObject, Gtk
 
 from lutris import runners
-from lutris.exceptions import watch_errors
 from lutris.gui.config.runner import RunnerConfigDialog
-from lutris.gui.dialogs import ErrorDialog, QuestionDialog
+from lutris.gui.dialogs import QuestionDialog
 from lutris.gui.dialogs.runner_install import RunnerInstallDialog
 from lutris.gui.widgets.scaled_image import ScaledImage
 from lutris.util.log import logger
@@ -80,42 +79,31 @@ class RunnerBox(Gtk.Box):
                 _button = Gtk.Button.new_from_icon_name("system-software-install-symbolic", Gtk.IconSize.BUTTON)
                 _button.get_style_context().add_class("circular")
                 _button.connect("clicked", self.on_install_clicked)
+                _button.set_sensitive(not self.runner.is_installed(flatpak_allowed=False))
         _button.show()
         return _button
 
-    @watch_errors()
     def on_versions_clicked(self, widget):
         window = self.get_toplevel()
         application = window.get_application()
         title = _("Manage %s versions") % self.runner.name
         application.show_window(RunnerInstallDialog, title=title, runner=self.runner, parent=window)
 
-    @watch_errors()
     def on_install_clicked(self, widget):
         """Install a runner."""
         logger.debug("Install of %s requested", self.runner)
-        window = self.get_toplevel()
-        try:
-            self.runner.install(window)
-        except (
-            runners.RunnerInstallationError,
-            runners.NonInstallableRunnerError,
-        ) as ex:
-            logger.error(ex)
-            ErrorDialog(ex.message, parent=self.get_toplevel())
-            return
+        self.runner.install(self.get_toplevel())
+
         if self.runner.is_installed():
             self.emit("runner-installed")
         else:
-            ErrorDialog("Runner failed to install", parent=self.get_toplevel())
+            raise RuntimeError("Runner failed to install")
 
-    @watch_errors()
     def on_configure_clicked(self, widget):
         window = self.get_toplevel()
         application = window.get_application()
         application.show_window(RunnerConfigDialog, runner=self.runner, parent=window)
 
-    @watch_errors()
     def on_remove_clicked(self, widget):
         dialog = QuestionDialog(
             {
@@ -126,22 +114,19 @@ class RunnerBox(Gtk.Box):
             }
         )
         if Gtk.ResponseType.YES == dialog.result:
-            self.runner.uninstall()
-            self.emit("runner-removed")
+            def on_runner_uninstalled():
+                self.emit("runner-removed")
 
-    @watch_errors()
+            self.runner.uninstall(on_runner_uninstalled)
+
     def on_runner_installed(self, widget):
         """Called after the runnner is installed"""
         self.runner_label_box.set_sensitive(True)
         self.action_alignment.get_children()[0].destroy()
         self.action_alignment.add(self.get_action_button())
 
-    @watch_errors()
     def on_runner_removed(self, widget):
         """Called after the runner is removed"""
         self.runner_label_box.set_sensitive(False)
         self.action_alignment.get_children()[0].destroy()
         self.action_alignment.add(self.get_action_button())
-
-    def on_watched_error(self, error):
-        ErrorDialog(error, parent=self.get_toplevel())

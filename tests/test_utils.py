@@ -67,14 +67,14 @@ class TestStringUtils(TestCase):
         slug = strings.slugify(name)
         self.assertTrue(len(slug) > 0)
 
-    def test_add_url_tags(self):
-        self.assertEqual(strings.add_url_tags("foo bar"), "foo bar")
+    def test_gtk_safe_urls(self):
+        self.assertEqual(strings.gtk_safe_urls("foo bar"), "foo bar")
         self.assertEqual(
-            strings.add_url_tags("foo http://lutris.net bar"),
+            strings.gtk_safe_urls("foo http://lutris.net bar"),
             "foo <a href=\"http://lutris.net\">http://lutris.net</a> bar"
         )
         self.assertEqual(
-            strings.add_url_tags("http://lutris.net"),
+            strings.gtk_safe_urls("http://lutris.net"),
             "<a href=\"http://lutris.net\">http://lutris.net</a>"
         )
         text = "foo http://lutris.net bar http://strycore.com"
@@ -82,7 +82,7 @@ class TestStringUtils(TestCase):
             'foo <a href="http://lutris.net">http://lutris.net</a> '
             'bar <a href="http://strycore.com">http://strycore.com</a>'
         )
-        self.assertEqual(strings.add_url_tags(text), expected)
+        self.assertEqual(strings.gtk_safe_urls(text), expected)
 
     def test_get_formatted_playtime(self):
         self.assertEqual(strings.get_formatted_playtime(None), strings.NO_PLAYTIME)
@@ -92,7 +92,28 @@ class TestStringUtils(TestCase):
         self.assertEqual(strings.get_formatted_playtime('-'), strings.NO_PLAYTIME)
         self.assertEqual(strings.get_formatted_playtime(0.5), "30 minutes")
         self.assertEqual(strings.get_formatted_playtime(1.5), "1 hour 30 minutes")
-        self.assertEqual(strings.get_formatted_playtime(45.90), "45 hours 53 minutes")
+        self.assertEqual(strings.get_formatted_playtime(45.90), "45 hours 54 minutes")
+
+    def test_parse_playtime(self):
+        self.assertEqual(strings.parse_playtime("0"), 0)
+        self.assertEqual(strings.parse_playtime("2.5"), 2.5)
+        self.assertEqual(strings.parse_playtime("30m"), 0.5)
+        self.assertEqual(strings.parse_playtime("30 min"), 0.5)
+        self.assertEqual(strings.parse_playtime("30 minutes"), 0.5)
+        self.assertEqual(strings.parse_playtime("1 hour"), 1)
+        self.assertEqual(strings.parse_playtime("1h"), 1)
+        self.assertEqual(strings.parse_playtime("1 hour 30 minutes"), 1.5)
+        self.assertEqual(strings.parse_playtime("1hour 30minutes"), 1.5)
+        self.assertEqual(strings.parse_playtime("1hour30minutes"), 1.5)
+        self.assertEqual(strings.parse_playtime("1hour30minute"), 1.5)
+        self.assertEqual(strings.parse_playtime("1HoUr30MiNuTe"), 1.5)
+        self.assertEqual(strings.parse_playtime("1h30min"), 1.5)
+        self.assertEqual(strings.parse_playtime("1h30m"), 1.5)
+        self.assertEqual(strings.parse_playtime("1H30M"), 1.5)
+        self.assertEqual(strings.parse_playtime("1 h 30 m"), 1.5)
+        self.assertEqual(strings.parse_playtime("2h45m"), 2.75)
+        self.assertEqual(strings.parse_playtime("2h45"), 2.75)
+        self.assertEqual(strings.parse_playtime("2:45"), 2.75)
 
 
 class TestVersionSort(TestCase):

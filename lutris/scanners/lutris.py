@@ -1,15 +1,15 @@
 import json
 import os
 import time
-from functools import lru_cache
 
 from lutris import settings
 from lutris.api import get_api_games, get_game_installers
 from lutris.database.games import get_games
 from lutris.game import Game
-from lutris.installer.errors import MissingGameDependency
+from lutris.installer.errors import MissingGameDependencyError
 from lutris.installer.interpreter import ScriptInterpreter
 from lutris.services.lutris import download_lutris_media
+from lutris.util import cache_single
 from lutris.util.log import logger
 from lutris.util.strings import slugify
 
@@ -94,7 +94,7 @@ def scan_directory(dirname):
             logger.info("Found %s in %s", api_game["name"], full_path)
             try:
                 install_game(installer, game_folder)
-            except MissingGameDependency as ex:
+            except MissingGameDependencyError as ex:
                 logger.error("Skipped %s: %s", api_game["name"], ex)
             download_lutris_media(installer["game_slug"])
             slugs_installed.add(api_game["slug"])
@@ -176,16 +176,16 @@ def add_to_path_cache(game):
 def remove_from_path_cache(game):
     logger.debug("Removing %s from path cache", game)
     current_cache = read_path_cache()
-    if str(game.id) not in current_cache:
+    if game.id not in current_cache:
         logger.warning("Game %s (id=%s) not in cache path", game, game.id)
         return
-    del current_cache[str(game.id)]
+    del current_cache[game.id]
     with open(GAME_PATH_CACHE_PATH, "w", encoding="utf-8") as cache_file:
         json.dump(current_cache, cache_file, indent=2)
     get_path_cache.cache_clear()
 
 
-@lru_cache()
+@cache_single
 def get_path_cache():
     """Return the contents of the path cache file; this
     dict is cached, so do not modify it."""

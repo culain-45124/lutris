@@ -5,8 +5,6 @@ from gettext import gettext as _
 from gi.repository import Gtk
 
 from lutris.database import categories as categories_db
-from lutris.exceptions import watch_errors
-from lutris.gui import dialogs
 from lutris.gui.dialogs import SavableModelessDialog
 
 
@@ -51,7 +49,7 @@ class EditGameCategoriesDialog(SavableModelessDialog):
         return frame
 
     def _create_add_category(self):
-        def on_add_category(widget=None):
+        def on_add_category(*_args):
             category_text = categories_db.strip_category_name(category_entry.get_text())
             if not categories_db.is_reserved_category(category_text):
                 for category_checkbox in self.grid.get_children():
@@ -69,6 +67,7 @@ class EditGameCategoriesDialog(SavableModelessDialog):
 
         category_entry = Gtk.Entry()
         category_entry.set_text("")
+        category_entry.connect("activate", on_add_category)
         hbox.pack_start(category_entry, True, True, 0)
 
         button = Gtk.Button.new_with_label(_("Add Category"))
@@ -78,7 +77,6 @@ class EditGameCategoriesDialog(SavableModelessDialog):
 
         return hbox
 
-    @watch_errors()
     def on_save(self, _button):
         """Save game info and destroy widget."""
         removed_categories = set()
@@ -98,6 +96,3 @@ class EditGameCategoriesDialog(SavableModelessDialog):
             self.game.update_game_categories(added_categories, removed_categories)
 
         self.destroy()
-
-    def on_watched_error(self, error):
-        dialogs.ErrorDialog(error, parent=self)

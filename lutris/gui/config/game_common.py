@@ -8,21 +8,21 @@ from gi.repository import GdkPixbuf, Gtk, Pango
 
 from lutris import runners, settings
 from lutris.config import LutrisConfig, make_game_config_id
-from lutris.exceptions import watch_errors
 from lutris.game import Game
 from lutris.gui import dialogs
 from lutris.gui.config import DIALOG_HEIGHT, DIALOG_WIDTH
-from lutris.gui.config.boxes import GameBox, RunnerBox, SystemBox
+from lutris.gui.config.boxes import GameBox, RunnerBox, SystemConfigBox, UnderslungMessageBox
 from lutris.gui.dialogs import DirectoryDialog, ErrorDialog, QuestionDialog, SavableModelessDialog
 from lutris.gui.dialogs.delegates import DialogInstallUIDelegate
-from lutris.gui.widgets.common import FloatEntry, Label, NumberEntry, SlugEntry
+from lutris.gui.widgets.common import Label, NumberEntry, SlugEntry
 from lutris.gui.widgets.notifications import send_notification
 from lutris.gui.widgets.scaled_image import ScaledImage
-from lutris.gui.widgets.utils import get_image_file_format, invalidate_media_caches
+from lutris.gui.widgets.utils import MEDIA_CACHE_INVALIDATED, get_image_file_format
 from lutris.runners import import_runner
 from lutris.services.lutris import LutrisBanner, LutrisCoverart, LutrisIcon, download_lutris_media
+from lutris.util.jobs import AsyncCall
 from lutris.util.log import logger
-from lutris.util.strings import slugify
+from lutris.util.strings import gtk_safe, parse_playtime, slugify
 
 
 # pylint: disable=too-many-instance-attributes, no-member
@@ -30,8 +30,9 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
     """Base class for config dialogs"""
     no_runner_label = _("Select a runner in the Game Info tab")
 
-    def __init__(self, title, parent=None):
+    def __init__(self, title, config_level, parent=None):
         super().__init__(title, parent=parent, border_width=0)
+        self.config_level = config_level
         self.set_default_size(DIALOG_WIDTH, DIALOG_HEIGHT)
         self.vbox.set_border_width(0)
 
@@ -39,6 +40,7 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
         self.name_entry = None
         self.sortname_entry = None
         self.runner_box = None
+        self.runner_warning_box = None
 
         self.timer_id = None
         self.game = None
@@ -88,14 +90,14 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
         self.update_advanced_switch_visibility(index)
         self.update_search_entry_visibility(index)
 
-    def build_tabs(self, config_level):
+    def build_tabs(self):
         """Build tabs (for game and runner levels)"""
         self.timer_id = None
-        if config_level == "game":
+        if self.config_level == "game":
             self._build_info_tab()
             self._build_game_tab()
-        self._build_runner_tab(config_level)
-        self._build_system_tab(config_level)
+        self._build_runner_tab()
+        self._build_system_tab()
 
         current_page_index = self.notebook.get_current_page()
         self.update_advanced_switch_visibility(current_page_index)
@@ -146,6 +148,10 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
 
         self.runner_box = self._get_runner_box()
         info_box.pack_start(self.runner_box, False, False, 6)  # Runner
+
+        self.runner_warning_box = RunnerMessageBox()
+        info_box.pack_start(self.runner_warning_box, False, False, 6)  # Runner
+        self.runner_warning_box.update_warning(self.runner_name)
 
         info_box.pack_start(self._get_year_box(), False, False, 6)  # Year
 
@@ -247,7 +253,6 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
             box.hide()
         return box
 
-    @watch_errors()
     def on_reset_preferred_launch_config_clicked(self, _button, launch_config_box):
         game_config = self.game.config.game_level.get("game", {})
         game_config.pop("preferred_launch_config_name", None)
@@ -319,13 +324,12 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
     def _get_playtime_box(self):
         box = Gtk.Box(spacing=12, margin_right=12, margin_left=12)
 
-        label = Label(_("Playtime (in hours)"))
+        label = Label(_("Playtime"))
         box.pack_start(label, False, False, 0)
-        self.playtime_entry = FloatEntry()
-        self.playtime_entry.set_max_length(10)
+        self.playtime_entry = Gtk.Entry()
 
         if self.game:
-            self.playtime_entry.set_text(f"{self.game.playtime}")
+            self.playtime_entry.set_text(self.game.formatted_playtime)
         box.pack_start(self.playtime_entry, True, True, 0)
 
         return box
@@ -367,7 +371,6 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
             runner_liststore.append(("%s (%s)" % (runner.human_name, description), runner.name))
         return runner_liststore
 
-    @watch_errors()
     def on_slug_change_clicked(self, widget):
         if self.slug_entry.get_sensitive() is False:
             widget.set_label(_("Apply"))
@@ -375,21 +378,20 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
         else:
             self.change_game_slug()
 
-    @watch_errors()
     def on_slug_entry_activate(self, _widget):
         self.change_game_slug()
 
     def change_game_slug(self):
         slug = self.slug_entry.get_text()
-        download_lutris_media(slug)
-
         self.slug = slug
-        for image_type, image_button in self.image_buttons.items():
-            self._set_image(image_type, image_button)
         self.slug_entry.set_sensitive(False)
         self.slug_change_button.set_label(_("Change"))
+        AsyncCall(download_lutris_media, self.refresh_all_images_cb, self.slug)
 
-    @watch_errors()
+    def refresh_all_images_cb(self, _result, _error):
+        for image_type, image_button in self.image_buttons.items():
+            self._set_image(image_type, image_button)
+
     def on_move_clicked(self, _button):
         new_location = DirectoryDialog("Select new location for the game",
                                        default_path=self.game.directory, parent=self)
@@ -399,7 +401,6 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
         move_dialog.connect("game-moved", self.on_game_moved)
         move_dialog.move()
 
-    @watch_errors()
     def on_game_moved(self, dialog):
         """Show a notification when the game is moved"""
         new_directory = dialog.new_directory
@@ -414,40 +415,41 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
 
     def _build_game_tab(self):
         def is_searchable(game):
-            return game.runner and len(game.runner.game_options) > 8
+            return game.has_runner and len(game.runner.game_options) > 8
 
         def has_advanced(game):
-            for opt in game.runner.game_options:
-                if opt.get("advanced"):
-                    return True
+            if game.has_runner:
+                for opt in game.runner.game_options:
+                    if opt.get("advanced"):
+                        return True
             return False
 
         if self.game and self.runner_name:
             self.game.runner_name = self.runner_name
             self.game_box = self._build_options_tab(_("Game options"),
-                                                    lambda: GameBox(self.lutris_config, self.game),
+                                                    lambda: GameBox(self.config_level, self.lutris_config, self.game),
                                                     advanced=has_advanced(self.game),
                                                     searchable=is_searchable(self.game))
         elif self.runner_name:
             game = Game(None)
             game.runner_name = self.runner_name
             self.game_box = self._build_options_tab(_("Game options"),
-                                                    lambda: GameBox(self.lutris_config, game),
+                                                    lambda: GameBox(self.config_level, self.lutris_config, game),
                                                     advanced=has_advanced(game),
                                                     searchable=is_searchable(game))
         else:
             self._build_missing_options_tab(self.no_runner_label, _("Game options"))
 
-    def _build_runner_tab(self, _config_level):
+    def _build_runner_tab(self):
         if self.runner_name:
             self.runner_box = self._build_options_tab(_("Runner options"),
-                                                      lambda: RunnerBox(self.lutris_config))
+                                                      lambda: RunnerBox(self.config_level, self.lutris_config))
         else:
             self._build_missing_options_tab(self.no_runner_label, _("Runner options"))
 
-    def _build_system_tab(self, _config_level):
+    def _build_system_tab(self):
         self.system_box = self._build_options_tab(_("System options"),
-                                                  lambda: SystemBox(self.lutris_config))
+                                                  lambda: SystemConfigBox(self.config_level, self.lutris_config))
 
     def _build_options_tab(self, notebook_label, box_factory, advanced=True, searchable=True):
         if not self.lutris_config:
@@ -528,13 +530,13 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
             self.game_box.advanced_visibility = value
 
     def _set_filter(self, value):
-        self.system_box.filter = value
-        if self.runner_name:
+        if self.system_box:
+            self.system_box.filter = value
+        if self.runner_box:
             self.runner_box.filter = value
-        if self.game:
+        if self.game_box:
             self.game_box.filter = value
 
-    @watch_errors()
     def on_runner_changed(self, widget):
         """Action called when runner drop down is changed."""
         new_runner_index = widget.get_active()
@@ -577,6 +579,7 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
             self.runner_name = runner_name
             self.lutris_config = LutrisConfig(runner_slug=self.runner_name, level="game")
         self._rebuild_tabs()
+        self.runner_warning_box.update_warning(self.runner_name)
         self.notebook.set_current_page(current_page)
 
     def _rebuild_tabs(self):
@@ -586,8 +589,8 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
         self.option_page_indices.clear()
         self.searchable_page_indices.clear()
         self._build_game_tab()
-        self._build_runner_tab("game")
-        self._build_system_tab("game")
+        self._build_runner_tab()
+        self._build_system_tab()
         self.show_all()
 
     def on_response(self, _widget, response):
@@ -607,11 +610,12 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
         if self.runner_name == "steam" and not self.lutris_config.game_config.get("appid"):
             ErrorDialog(_("Steam AppID not provided"), parent=self)
             return False
-        if self.playtime_entry.get_text():
+        playtime_text = self.playtime_entry.get_text()
+        if playtime_text and playtime_text != self.game.formatted_playtime:
             try:
-                float(self.playtime_entry.get_text())
-            except ValueError:
-                ErrorDialog(_("The entered playtime is invalid"), parent=self)
+                parse_playtime(playtime_text)
+            except ValueError as ex:
+                ErrorDialog(ex, parent=self)
                 return False
 
         invalid_fields = []
@@ -634,7 +638,6 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
             return False
         return True
 
-    @watch_errors()
     def on_save(self, _button):
         """Save game info and destroy widget."""
         if not self.is_valid():
@@ -654,8 +657,9 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
             year = int(self.year_entry.get_text())
 
         playtime = None
-        if self.playtime_entry.get_text():
-            playtime = float(self.playtime_entry.get_text())
+        playtime_text = self.playtime_entry.get_text()
+        if playtime_text and playtime_text != self.game.formatted_playtime:
+            playtime = parse_playtime(playtime_text)
 
         if not self.lutris_config.game_config_id:
             self.lutris_config.game_config_id = make_game_config_id(self.slug)
@@ -664,7 +668,8 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
         self.game.sortname = sortname
         self.game.slug = self.slug
         self.game.year = year
-        self.game.playtime = playtime
+        if playtime:
+            self.game.playtime = playtime
         self.game.is_installed = True
         self.game.config = self.lutris_config
         self.game.runner_name = self.runner_name
@@ -677,7 +682,6 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
         self.saved = True
         return True
 
-    @watch_errors()
     def on_custom_image_select(self, _widget, image_type):
         dialog = Gtk.FileChooserNative.new(
             _("Please choose a custom image"),
@@ -691,48 +695,72 @@ class GameDialogCommon(SavableModelessDialog, DialogInstallUIDelegate):
         image_filter.set_name(_("Images"))
         image_filter.add_pixbuf_formats()
         dialog.add_filter(image_filter)
-
         response = dialog.run()
         if response == Gtk.ResponseType.ACCEPT:
-            slug = self.slug or self.game.slug
             image_path = dialog.get_filename()
-            service_media = self.service_medias[image_type]
-            self.game.custom_images.add(image_type)
-            dest_path = service_media.get_media_path(slug)
-            file_format = service_media.file_format
-
-            if image_path != dest_path:
-                if file_format == get_image_file_format(image_path):
-                    shutil.copy(image_path, dest_path, follow_symlinks=True)
-                else:
-                    # If we must transcode the image, we'll scale the image up based on
-                    # the UI scale factor, to try to avoid blurriness. Of course this won't
-                    # work if the user changes the scaling later, but what can you do.
-                    scale_factor = self.get_scale_factor()
-                    width, height = service_media.custom_media_storage_size
-                    width = width * scale_factor
-                    height = height * scale_factor
-                    pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(image_path, width, height)
-                    # JPEG encoding looks rather better at high quality;
-                    # PNG encoding just ignores this option.
-                    pixbuf.savev(dest_path, file_format, ["quality"], ["100"])
-                invalidate_media_caches()
-            self._set_image(image_type, self.image_buttons[image_type])
-            service_media.update_desktop()
-
+            scale_factor = self.get_scale_factor()  # get this here for thread-safety
+            AsyncCall(self.save_custom_media, self.image_refreshed_cb, image_type, image_path, scale_factor)
         dialog.destroy()
 
-    @watch_errors()
     def on_custom_image_reset_clicked(self, _widget, image_type):
+        AsyncCall(self.refresh_image, self.image_refreshed_cb, image_type)
+
+    def save_custom_media(self, image_type, image_path, scale_factor):
+        slug = self.slug or self.game.slug
+        service_media = self.service_medias[image_type]
+        self.game.custom_images.add(image_type)
+        dest_path = service_media.get_media_path(slug)
+        file_format = service_media.file_format
+
+        if image_path != dest_path:
+            if file_format == get_image_file_format(image_path):
+                shutil.copy(image_path, dest_path, follow_symlinks=True)
+            else:
+                # If we must transcode the image, we'll scale the image up based on
+                # the UI scale factor, to try to avoid blurriness. Of course this won't
+                # work if the user changes the scaling later, but what can you do.
+                width, height = service_media.custom_media_storage_size
+                width = width * scale_factor
+                height = height * scale_factor
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(image_path, width, height)
+                # JPEG encoding looks rather better at high quality;
+                # PNG encoding just ignores this option.
+                pixbuf.savev(dest_path, file_format, ["quality"], ["100"])
+            MEDIA_CACHE_INVALIDATED.fire()
+        return image_type
+
+    def refresh_image(self, image_type):
         slug = self.slug or self.game.slug
         service_media = self.service_medias[image_type]
         dest_path = service_media.get_media_path(slug)
         self.game.custom_images.discard(image_type)
+
         if os.path.isfile(dest_path):
             os.remove(dest_path)
         download_lutris_media(self.game.slug)
-        invalidate_media_caches()
-        self._set_image(image_type, self.image_buttons[image_type])
+        MEDIA_CACHE_INVALIDATED.fire()
+        return image_type
 
-    def on_watched_error(self, error):
-        dialogs.ErrorDialog(error, parent=self)
+    def image_refreshed_cb(self, image_type, _error):
+        if image_type:
+            self._set_image(image_type, self.image_buttons[image_type])
+            service_media = self.service_medias[image_type]
+            service_media.run_system_update_desktop_icons()
+
+
+class RunnerMessageBox(UnderslungMessageBox):
+    def __init__(self):
+        super().__init__(margin_left=12, margin_right=12, icon_name="dialog-warning")
+
+    def update_warning(self, runner_name):
+        try:
+            if runner_name:
+                runner_class = import_runner(runner_name)
+                runner = runner_class()
+                warning = runner.runner_warning
+                if warning:
+                    self.show_markup(warning)
+                    return
+            self.show_markup(None)
+        except Exception as ex:
+            self.show_message(gtk_safe(ex))

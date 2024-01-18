@@ -98,8 +98,6 @@ class MonitoredCommand:
             return wrapper_command + self.command
 
         terminal_path = system.find_executable(self.terminal)
-        if not terminal_path:
-            raise RuntimeError("Couldn't find terminal %s" % self.terminal)
         script_path = get_terminal_script(self.command, self.cwd, self.env)
         return wrapper_command + [terminal_path, "-e", script_path]
 
@@ -121,6 +119,7 @@ class MonitoredCommand:
     def get_environment(user_env):
         """Process the user provided environment variables for use as self.env"""
         env = copy(user_env) if user_env else {}
+
         # not clear why this needs to be added, the path is already added in
         # the wrappper script.
         env['PYTHONPATH'] = ':'.join(sys.path)
@@ -143,14 +142,15 @@ class MonitoredCommand:
 
     def get_child_environment(self):
         """Returns the calculated environment for the child process."""
-        env = os.environ.copy()
+        env = system.get_environment()
         env.update(self.env)
         return env
 
     def start(self):
         """Run the thread."""
-        # for key, value in self.env.items():
-        #     logger.debug("%s=\"%s\"", key, value)
+        if os.environ.get("LUTRIS_DEBUG_ENV") == "1":
+            for key, value in self.env.items():
+                logger.debug("%s=\"%s\"", key, value)
         wrapper_command = self.get_wrapper_command()
         env = self.get_child_environment()
         self.game_process = self.execute_process(wrapper_command, env)
@@ -171,8 +171,18 @@ class MonitoredCommand:
             self.on_stdout_output,
         )
 
+    def log_filter(self, line):
+        """Filter out some message we don't want to show to the user."""
+        if "GStreamer-WARNING **" in line:
+            return False
+        if "Bad file descriptor" in line:
+            return False
+        return True
+
     def log_handler_stdout(self, line):
         """Add the line to this command's stdout attribute"""
+        if not self.log_filter(line):
+            return
         self._stdout.write(line)
 
     def log_handler_buffer(self, line):
@@ -181,6 +191,8 @@ class MonitoredCommand:
 
     def log_handler_console_output(self, line):
         """Print the line to stdout"""
+        if not self.log_filter(line):
+            return
         with contextlib.suppress(BlockingIOError):
             sys.stdout.write(line)
             sys.stdout.flush()

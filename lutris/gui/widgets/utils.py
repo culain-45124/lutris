@@ -6,6 +6,8 @@ import cairo
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk
 
 from lutris import settings
+from lutris.exceptions import MissingMediaError
+from lutris.gui.widgets import NotificationSource
 from lutris.util import datapath, magic, system
 from lutris.util.log import logger
 
@@ -16,8 +18,7 @@ except ImportError:
 
 ICON_SIZE = (32, 32)
 BANNER_SIZE = (184, 69)
-
-_surface_generation_number = 0
+MEDIA_CACHE_INVALIDATED = NotificationSource()
 
 
 def get_main_window(widget):
@@ -78,41 +79,27 @@ def get_scaled_surface_by_path(path, size, device_scale, preserve_aspect_ratio=T
     If the path cannot be read, this returns None.
     """
     pixbuf = get_pixbuf_by_path(path)
-    if pixbuf:
-        pixbuf_width = pixbuf.get_width()
-        pixbuf_height = pixbuf.get_height()
+    pixbuf_width = pixbuf.get_width()
+    pixbuf_height = pixbuf.get_height()
 
-        scale_x = (size[0] / pixbuf_width) * device_scale
-        scale_y = (size[1] / pixbuf_height) * device_scale
+    scale_x = (size[0] / pixbuf_width) * device_scale
+    scale_y = (size[1] / pixbuf_height) * device_scale
 
-        if preserve_aspect_ratio:
-            scale_x = min(scale_x, scale_y)
-            scale_y = scale_x
+    if preserve_aspect_ratio:
+        scale_x = min(scale_x, scale_y)
+        scale_y = scale_x
 
-        pixel_width = int(round(pixbuf_width * scale_x))
-        pixel_height = int(round(pixbuf_height * scale_y))
+    pixel_width = int(round(pixbuf_width * scale_x))
+    pixel_height = int(round(pixbuf_height * scale_y))
 
-        surface = cairo.ImageSurface(cairo.Format.ARGB32, pixel_width, pixel_height)  # pylint:disable=no-member
-        cr = cairo.Context(surface)  # pylint:disable=no-member
-        cr.scale(scale_x, scale_y)
-        Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
-        cr.get_source().set_extend(cairo.Extend.PAD)  # pylint: disable=no-member
-        cr.paint()
-        surface.set_device_scale(device_scale, device_scale)
-        return surface
-
-
-def get_media_generation_number():
-    """Returns a number that is incremented whenever cached media may no longer
-    be valid. Caller can check to see if this has changed before using their own caches."""
-    return _surface_generation_number
-
-
-def invalidate_media_caches():
-    """Increments the media generation number; this indicates that cached media
-    from earlier generations may be invalid and should be reloaded."""
-    global _surface_generation_number
-    _surface_generation_number += 1
+    surface = cairo.ImageSurface(cairo.Format.ARGB32, pixel_width, pixel_height)  # pylint:disable=no-member
+    cr = cairo.Context(surface)  # pylint:disable=no-member
+    cr.scale(scale_x, scale_y)
+    Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
+    cr.get_source().set_extend(cairo.Extend.PAD)  # pylint: disable=no-member
+    cr.paint()
+    surface.set_device_scale(device_scale, device_scale)
+    return surface
 
 
 def get_default_icon_path(size):
@@ -128,9 +115,10 @@ def get_default_icon_path(size):
 def get_pixbuf_by_path(path, size=None, preserve_aspect_ratio=True):
     """Reads an image file and returns the pixbuf. If you provide a size, this scales
     the file to fit that size, preserving the aspect ratio if preserve_aspect_ratio is
-    True. If the file is missing or unreadable, or if 'path' is None, this returns None."""
+    True. If the file is missing or unreadable, or if 'path' is None, this raises
+    MissingMediaError."""
     if not system.path_exists(path, exclude_empty=True):
-        return None
+        raise MissingMediaError(filename=path)
 
     try:
         if size:
@@ -142,8 +130,9 @@ def get_pixbuf_by_path(path, size=None, preserve_aspect_ratio=True):
             return GdkPixbuf.Pixbuf.new_from_file_at_scale(path, width, height, preserve_aspect_ratio=False)
 
         return GdkPixbuf.Pixbuf.new_from_file(path)
-    except GLib.GError:
+    except GLib.GError as ex:
         logger.exception("Unable to load icon from image %s", path)
+        raise MissingMediaError(message=str(ex), filename=path) from ex
 
 
 def has_stock_icon(name):
@@ -162,6 +151,9 @@ def get_runtime_icon_path(icon_name):
 
     Arguments:
     icon_name -- The name of the icon to retrieve
+
+    Returns:
+        The path to the icon, or raises MissingMediaError if it wasn't found.
     """
     filename = icon_name.lower().replace(" ", "")
     # We prefer bitmaps over SVG, because we've got some SVG icons with the
@@ -178,7 +170,7 @@ def get_runtime_icon_path(icon_name):
             icon_path = os.path.join(settings.RUNTIME_DIR, search_dir, filename + ext)
             if os.path.exists(icon_path):
                 return icon_path
-    return None
+    raise MissingMediaError("The icon '%s' could not be found." % icon_name)
 
 
 def convert_to_background(background_path, target_size=(320, 1080)):
@@ -193,7 +185,7 @@ def convert_to_background(background_path, target_size=(320, 1080)):
     # Resize and crop coverart
     width = int(orig_width * (image_height / orig_height))
     offset = int((width - target_width) / 2)
-    coverart = coverart.resize((width, image_height), resample=Image.BICUBIC)
+    coverart = coverart.resize((width, image_height), resample=Image.Resampling.BICUBIC)
     coverart = coverart.crop((offset, 0, target_width + offset, image_height))
 
     # Resize canvas of coverart by putting transparent pixels on the bottom
@@ -227,7 +219,7 @@ def thumbnail_image(base_image, target_size):
         height = int(base_height * (target_width / base_width))
     x_offset = int((width - target_width) / 2)
     y_offset = int((height - target_height) / 2)
-    base_image = base_image.resize((width, height), resample=Image.BICUBIC)
+    base_image = base_image.resize((width, height), resample=Image.Resampling.BICUBIC)
     base_image = base_image.crop((x_offset, y_offset, width - x_offset, height - y_offset))
     return base_image
 

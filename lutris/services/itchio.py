@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 from gettext import gettext as _
+from typing import List
 from urllib.parse import quote_plus, urlencode
 
 from lutris import settings
@@ -40,6 +41,16 @@ class ItchIoCover(ServiceMedia):
         else:
             logger.warning("No field 'cover_url' in API game %s", details)
         return
+
+
+class ItchIoCoverMedium(ItchIoCover):
+    """itch.io game cover, at 60% size"""
+    size = (189, 150)
+
+
+class ItchIoCoverSmall(ItchIoCover):
+    """itch.io game cover, at 30% size"""
+    size = (95, 75)
 
 
 class ItchIoGame(ServiceGame):
@@ -82,6 +93,8 @@ class ItchIoService(OnlineService):
     drm_free = True
     has_extras = True
     medias = {
+        "banner_small": ItchIoCoverSmall,
+        "banner_med": ItchIoCoverMedium,
         "banner": ItchIoCover,
     }
     default_format = "banner"
@@ -310,9 +323,12 @@ class ItchIoService(OnlineService):
                     "id": str(upload["id"]),
                 }
             )
-        if len(extras) > 0:
+        if extras:
             all_extras["Bonus Content"] = extras
         return all_extras
+
+    def get_installed_slug(self, db_game):
+        return db_game["slug"]
 
     def generate_installer(self, db_game):
         """Auto generate installer for itch.io game"""
@@ -340,7 +356,7 @@ class ItchIoService(OnlineService):
             "name": db_game["name"],
             "version": "itch.io",
             "slug": db_game["slug"],
-            "game_slug": db_game["slug"],
+            "game_slug": self.get_installed_slug(db_game),
             "runner": runner,
             "itchid": db_game["appid"],
             "script": {
@@ -351,6 +367,28 @@ class ItchIoService(OnlineService):
                 "installer": script,
             }
         }
+
+    def get_installed_runner_name(self, db_game):
+        details = json.loads(db_game["details"])
+
+        if "p_linux" in details["traits"]:
+            return "linux"
+        if "p_windows" in details["traits"]:
+            return "wine"
+
+        return ""
+
+    def get_game_platforms(self, db_game: dict) -> List[str]:
+        platforms = []
+        details = json.loads(db_game["details"])
+
+        if "p_linux" in details["traits"]:
+            platforms.append("Linux")
+
+        if "p_windows" in details["traits"]:
+            platforms.append("Windows")
+
+        return platforms
 
     def _check_update_with_db(self, db_game, key, upload=None):
         stamp = 0
@@ -428,7 +466,7 @@ class ItchIoService(OnlineService):
                 "version": "itch.io",
                 "name": db_game["name"],
                 "slug": db_game["installer_slug"],
-                "game_slug": db_game["slug"],
+                "game_slug": self.get_installed_slug(db_game),
                 "runner": db_game["runner"],
                 "script": {
                     "extends": db_game["installer_slug"],
@@ -488,8 +526,10 @@ class ItchIoService(OnlineService):
         filtered = []
         extras = []
         files = []
+        extra_files = []
         link = None
         filename = "setup.zip"
+        selected_extras_ids = set(x["id"] for x in selected_extras or [])
 
         file = next(_file.copy() for _file in installer.script_files if _file.id == installer_file_id)
         if not file.url.startswith("N/A"):
@@ -503,9 +543,9 @@ class ItchIoService(OnlineService):
             "date": int(datetime.datetime.now().timestamp())
         }
 
-        if not link or len(selected_extras) > 0:
+        if not link or len(selected_extras_ids) > 0:
             for upload in uploads["uploads"]:
-                if selected_extras and (upload["type"] in self.extra_types):
+                if selected_extras_ids and (upload["type"] in self.extra_types):
                     extras.append(upload)
                     continue
                 # default =  games/tools ("executables")
@@ -555,10 +595,10 @@ class ItchIoService(OnlineService):
             )
 
         for extra in extras:
-            if str(extra["id"]) not in selected_extras:
+            if str(extra["id"]) not in selected_extras_ids:
                 continue
             link = self.get_download_link(extra["id"], key)
-            files.append(
+            extra_files.append(
                 InstallerFile(installer.game_slug, str(extra["id"]), {
                     "url": link,
                     "filename": extra["filename"],
@@ -566,7 +606,7 @@ class ItchIoService(OnlineService):
                 })
             )
 
-        return files
+        return files, extra_files
 
     def get_patch_files(self, installer, installer_file_id):
         """Similar to get_installer_files but for patches"""

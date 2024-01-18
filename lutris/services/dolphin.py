@@ -1,6 +1,7 @@
 import json
 import os
 from gettext import gettext as _
+from typing import List
 
 from PIL import Image
 
@@ -27,6 +28,7 @@ class DolphinService(BaseService):
     id = "dolphin"
     icon = "dolphin"
     name = _("Dolphin")
+    runner = "dolphin"
     local = True
     medias = {
         "icon": DolphinBanner
@@ -47,8 +49,8 @@ class DolphinService(BaseService):
             "name": db_game["name"],
             "version": "Dolphin",
             "slug": db_game["slug"],
-            "game_slug": slugify(db_game["name"]),
-            "runner": "dolphin",
+            "game_slug": self.get_installed_slug(db_game),
+            "runner": self.get_installed_runner_name(db_game),
             "script": {
                 "game": {
                     "main_file": details["path"],
@@ -57,13 +59,17 @@ class DolphinService(BaseService):
             }
         }
 
+    def get_installed_runner_name(self, db_game):
+        return self.runner
+
     def get_game_directory(self, installer):
         """Pull install location from installer"""
         return os.path.dirname(installer["script"]["game"]["main_file"])
 
-    def get_game_platforms(self, db_game):
-        if "details" in db_game:
-            details = json.loads(db_game.get("details"))
+    def get_game_platforms(self, db_game: dict) -> List[str]:
+        details_json = db_game.get("details")
+        if details_json:
+            details = json.loads(details_json)
             if details and details.get("platform"):
                 platform_value = details["platform"]
                 if platform_value.isdigit():
@@ -73,7 +79,7 @@ class DolphinService(BaseService):
                         return [platform]
 
                 return [platform_value]
-        return None
+        return []
 
 
 class DolphinGame(ServiceGame):

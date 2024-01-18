@@ -2,11 +2,14 @@ import os
 import shutil
 from gettext import gettext as _
 from pathlib import Path
+from typing import Callable
 
 from lutris.command import MonitoredCommand
+from lutris.exceptions import GameConfigError, MissingExecutableError
 from lutris.runners import NonInstallableRunnerError
 from lutris.runners.runner import Runner
 from lutris.util import flatpak as _flatpak
+from lutris.util import system
 from lutris.util.strings import split_arguments
 
 
@@ -72,6 +75,7 @@ class flatpak(Runner):
             "option": "working_dir",
             "type": "directory_chooser",
             "label": _("Working directory"),
+            "warn_if_non_writable_parent": True,
             "help": _("The directory to run the command in. Note that this must be a directory inside the sandbox."),
             "advanced": True
         },
@@ -86,11 +90,14 @@ class flatpak(Runner):
         }
     ]
 
-    def is_installed(self):
+    def is_installed(self, flatpak_allowed: bool = True) -> bool:
         return _flatpak.is_installed()
 
-    def get_executable(self):
-        return _flatpak.get_executable()
+    def get_executable(self) -> str:
+        exe = _flatpak.get_executable()
+        if not system.path_exists(exe):
+            raise MissingExecutableError(_("The Flatpak executable could not be found."))
+        return exe
 
     def install(self, install_ui_delegate, version=None, callback=None):
         raise NonInstallableRunnerError(
@@ -101,8 +108,8 @@ class flatpak(Runner):
     def can_uninstall(self):
         return False
 
-    def uninstall(self):
-        """Flatpak can't be uninstalled from Lutris"""
+    def uninstall(self, uninstall_callback: Callable[[], None]) -> None:
+        raise RuntimeError("Flatpak can't be uninstalled from Lutris")
 
     @property
     def game_path(self):
@@ -124,24 +131,27 @@ class flatpak(Runner):
         )
         command.start()
 
-    def play(self):
+    def get_command(self):
         arch = self.game_config.get("arch", "")
         branch = self.game_config.get("branch", "")
-        args = self.game_config.get("args", "")
-        appid = self.game_config.get("appid", "")
         fcommand = self.game_config.get("fcommand", "")
+        return _flatpak.get_bare_run_command(arch, fcommand, branch)
+
+    def play(self):
+        appid = self.game_config.get("appid", "")
+        args = self.game_config.get("args", "")
 
         if not appid:
-            return {"error": "CUSTOM", "text": "No application specified."}
+            raise GameConfigError(_("No application specified."))
 
         if appid.count(".") < 2:
-            return {"error": "CUSTOM", "text": "Application ID is not specified in correct format."
-                                               "Must be something like: tld.domain.app"}
+            raise GameConfigError(_("Application ID is not specified in correct format."
+                                    "Must be something like: tld.domain.app"))
 
         if any(x in appid for x in ("--", "/")):
-            return {"error": "CUSTOM", "text": "Application ID field must not contain options or arguments."}
+            raise GameConfigError(_("Application ID field must not contain options or arguments."))
 
-        command = _flatpak.get_run_command(appid, arch, fcommand, branch)
+        command = self.get_command() + [appid]
         if args:
             command.extend(split_arguments(args))
         return {"command": command}

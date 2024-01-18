@@ -3,6 +3,7 @@ import os
 from gettext import gettext as _
 
 from lutris import runtime, settings
+from lutris.exceptions import GameConfigError
 from lutris.runners.runner import Runner
 from lutris.util import system
 from lutris.util.jobs import AsyncCall
@@ -126,6 +127,12 @@ class mame(Runner):  # pylint: disable=invalid-name
             "help": _("Command line arguments used when launching the game"),
         },
         {
+            "option": "slots",
+            "type": "string",
+            "label": ("Slot System"),
+            "help": ("For slot devices that is needed for romsloads"),
+        },
+        {
             "option": "autoboot_command",
             "type": "string",
             "section": _("Autoboot"),
@@ -190,8 +197,8 @@ class mame(Runner):  # pylint: disable=invalid-name
             "section": _("Graphics"),
             "label": _("Wait for VSync"),
             "help":
-            _("Enable waiting for  the  start  of  vblank  before "
-              "flipping  screens; reduces tearing effects."),
+                _("Enable waiting for  the  start  of  vblank  before "
+                  "flipping  screens; reduces tearing effects."),
             "advanced": True,
             "default": False,
         },
@@ -247,17 +254,16 @@ class mame(Runner):  # pylint: disable=invalid-name
 
     def write_xml_list(self):
         """Write the full game list in XML to disk"""
+        env = runtime.get_env()
+        listxml_command = self.get_command() + ["-listxml"]
         os.makedirs(self.cache_dir, exist_ok=True)
-        output = system.execute(
-            self.get_command() + ["-listxml"],
-            env=runtime.get_env()
-        )
+        output, error_output = system.execute_with_error(listxml_command, env=env)
         if output:
             with open(self.xml_path, "w", encoding='utf-8') as xml_file:
                 xml_file.write(output)
             logger.info("MAME XML list written to %s", self.xml_path)
         else:
-            logger.warning("Couldn't get any output for mame -listxml")
+            logger.warning("Couldn't get any output for mame -listxml: %s", error_output)
 
     def get_platform(self):
         selected_platform = self.game_config.get("platform")
@@ -317,9 +323,11 @@ class mame(Runner):  # pylint: disable=invalid-name
             if rompath:
                 command += ["-rompath", rompath]
             command.append(self.game_config["machine"])
+            for slot_arg in split_arguments(self.game_config.get("slots")):
+                command.append(slot_arg)
             device = self.game_config.get("device")
             if not device:
-                return {'error': "CUSTOM", "text": "No device is set for machine %s" % self.game_config["machine"]}
+                raise GameConfigError(_("No device is set for machine %s") % self.game_config["machine"])
             rom = self.game_config.get("main_file")
             if rom:
                 command += ["-" + device, rom]
@@ -329,7 +337,7 @@ class mame(Runner):  # pylint: disable=invalid-name
                 rompath = self.runner_config.get("rompath")
             rom = os.path.basename(self.game_config.get("main_file"))
             if not rompath:
-                return {'error': 'PATH_NOT_SET', 'path': 'rompath'}
+                raise GameConfigError(_("The path '%s' is not set. please set it in the options.") % 'rompath')
             command += ["-rompath", rompath, rom]
 
         if self.game_config.get("autoboot_command"):

@@ -4,6 +4,7 @@ from gettext import gettext as _
 
 # Lutris Modules
 from lutris import settings
+from lutris.exceptions import MissingGameExecutableError
 from lutris.runners.runner import Runner
 from lutris.util import system
 
@@ -41,7 +42,7 @@ class mupen64plus(Runner):
         return os.path.join(settings.RUNNER_DIR, "mupen64plus")
 
     def play(self):
-        arguments = [self.get_executable()]
+        arguments = self.get_command()
         if self.runner_config.get("hideosd"):
             arguments.append("--noosd")
         else:
@@ -52,6 +53,6 @@ class mupen64plus(Runner):
             arguments.append("--windowed")
         rom = self.game_config.get("main_file") or ""
         if not system.path_exists(rom):
-            return {"error": "FILE_NOT_FOUND", "file": rom}
+            raise MissingGameExecutableError(filename=rom)
         arguments.append(rom)
         return {"command": arguments}

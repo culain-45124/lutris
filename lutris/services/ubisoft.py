@@ -12,8 +12,8 @@ from lutris.config import LutrisConfig, write_game_config
 from lutris.database.games import add_game, get_game_by_field, update_existing
 from lutris.database.services import ServiceGameCollection
 from lutris.game import Game
-from lutris.installer import get_installers
 from lutris.services.base import OnlineService
+from lutris.services.lutris import sync_media
 from lutris.services.service_game import ServiceGame
 from lutris.services.service_media import ServiceMedia
 from lutris.util.log import logger
@@ -191,12 +191,13 @@ class UbisoftConnectService(OnlineService):
         launch_id = details.get("launchId") or details.get("installId") or details.get("spaceId")
         game_config["game"]["args"] = f"uplay://launch/{launch_id}"
         configpath = write_game_config(lutris_game_id, game_config)
+        slug = self.get_installed_slug(game)
         if existing_game:
             update_existing(
                 id=existing_game["id"],
                 name=game["name"],
                 runner=self.runner,
-                slug=slugify(game["name"]),
+                slug=slug,
                 directory=ubisoft_connect["directory"],
                 installed=1,
                 installer_slug=lutris_game_id,
@@ -205,10 +206,10 @@ class UbisoftConnectService(OnlineService):
                 service_id=game["appid"],
             )
             return existing_game["id"]
-        game_id = add_game(
+        add_game(
             name=game["name"],
             runner=self.runner,
-            slug=slugify(game["name"]),
+            slug=slug,
             directory=ubisoft_connect["directory"],
             installed=1,
             installer_slug=lutris_game_id,
@@ -216,7 +217,7 @@ class UbisoftConnectService(OnlineService):
             service=self.id,
             service_id=game["appid"],
         )
-        return game_id
+        return slug
 
     def add_installed_games(self):
         ubisoft_connect = get_game_by_field(self.client_installer, "slug")
@@ -225,12 +226,16 @@ class UbisoftConnectService(OnlineService):
             return
         prefix_path = ubisoft_connect["directory"].split("drive_c")[0]
         prefix = WinePrefixManager(prefix_path)
+        installed_slugs = []
         for game in ServiceGameCollection.get_for_service(self.id):
             details = json.loads(game["details"])
             install_path = get_ubisoft_registry(prefix, details.get("registryPath"))
             exe = get_ubisoft_registry(prefix, details.get("exe"))
             if install_path and exe:
-                self.install_from_ubisoft(ubisoft_connect, game)
+                slug = self.install_from_ubisoft(ubisoft_connect, game)
+                if slug:
+                    installed_slugs.append(slug)
+        sync_media(installed_slugs)
 
     def generate_installer(self, db_game, ubi_db_game):
         ubisoft_connect = Game(ubi_db_game["id"])
@@ -244,8 +249,8 @@ class UbisoftConnectService(OnlineService):
             "name": db_game["name"],
             "version": self.name,
             "slug": slugify(db_game["name"]) + "-" + self.id,
-            "game_slug": slugify(db_game["name"]),
-            "runner": self.runner,
+            "game_slug": self.get_installed_slug(db_game),
+            "runner": self.get_installed_runner_name(db_game),
             "appid": db_game["appid"],
             "script": {
                 "requires": self.client_installer,
@@ -267,14 +272,16 @@ class UbisoftConnectService(OnlineService):
             }
         }
 
+    def get_installed_runner_name(self, db_game):
+        return self.runner
+
     def install(self, db_game):
         """Install a game or Ubisoft Connect if not already installed"""
         ubisoft_connect = get_game_by_field(self.client_installer, "slug")
         application = Gio.Application.get_default()
         if not ubisoft_connect or not ubisoft_connect["installed"]:
             logger.warning("Ubisoft Connect (%s) not installed", self.client_installer)
-            installers = get_installers(game_slug=self.client_installer)
-            application.show_installer_window(installers)
+            application.show_lutris_installer_window(game_slug=self.client_installer)
         else:
             application.show_installer_window(
                 [self.generate_installer(db_game, ubisoft_connect)],

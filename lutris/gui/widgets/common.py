@@ -35,19 +35,6 @@ class NumberEntry(Gtk.Entry, Gtk.Editable):
         return position
 
 
-class FloatEntry(Gtk.Entry, Gtk.Editable):
-
-    def do_insert_text(self, new_text, length, position):
-        """Filter inserted characters to only accept floating-point numbers"""
-        decimal_count = self.get_buffer().get_text().count(".")
-        new_text = "".join([c for c in new_text if c.isnumeric() or (c == "." and decimal_count < 1)])
-        if new_text:
-            length = len(new_text)
-            self.get_buffer().insert_text(position, new_text, length)
-            return position + length
-        return position
-
-
 class FileChooserEntry(Gtk.Box):
     """Editable entry with a file picker button"""
 
@@ -64,10 +51,11 @@ class FileChooserEntry(Gtk.Box):
         text=None,
         default_path=None,
         warn_if_non_empty=False,
+        warn_if_non_writable_parent=False,
         warn_if_ntfs=False,
         activates_default=False,
         shell_quoting=False
-    ):
+    ):  # pylint: disable=too-many-arguments
         super().__init__(
             orientation=Gtk.Orientation.VERTICAL,
             spacing=0,
@@ -76,6 +64,7 @@ class FileChooserEntry(Gtk.Box):
         self.title = title
         self.action = action
         self.warn_if_non_empty = warn_if_non_empty
+        self.warn_if_non_writable_parent = warn_if_non_writable_parent
         self.warn_if_ntfs = warn_if_ntfs
         self.shell_quoting = shell_quoting
 
@@ -94,6 +83,7 @@ class FileChooserEntry(Gtk.Box):
         self.entry.connect("backspace", self.on_backspace)
 
         browse_button = Gtk.Button.new_from_icon_name("view-more-horizontal-symbolic", Gtk.IconSize.BUTTON)
+        browse_button.show()
         if action == Gtk.FileChooserAction.SELECT_FOLDER:
             browse_button.set_tooltip_text(_("Select a folder"))
         else:
@@ -102,6 +92,7 @@ class FileChooserEntry(Gtk.Box):
         browse_button.connect("clicked", self.on_browse_clicked)
 
         self.open_button = Gtk.Button.new_from_icon_name("folder-symbolic", Gtk.IconSize.BUTTON)
+        self.open_button.show()
         self.open_button.set_tooltip_text(_("Open in file browser"))
         self.open_button.get_style_context().add_class("circular")
         self.open_button.connect("clicked", self.on_open_clicked)
@@ -250,14 +241,15 @@ class FileChooserEntry(Gtk.Box):
                 "contains files. Installation will not work properly."
             ))
             self.pack_end(non_empty_label, False, False, 10)
-        parent = system.get_existing_parent(path)
-        if parent is not None and not os.access(parent, os.W_OK):
-            non_writable_destination_label = Gtk.Label(visible=True)
-            non_writable_destination_label.set_markup(_(
-                "<b>Warning</b> The destination folder "
-                "is not writable by the current user."
-            ))
-            self.pack_end(non_writable_destination_label, False, False, 10)
+        if self.warn_if_non_writable_parent:
+            parent = system.get_existing_parent(path)
+            if parent is not None and not os.access(parent, os.W_OK):
+                non_writable_destination_label = Gtk.Label(visible=True)
+                non_writable_destination_label.set_markup(_(
+                    "<b>Warning</b> The destination folder "
+                    "is not writable by the current user."
+                ))
+                self.pack_end(non_writable_destination_label, False, False, 10)
 
         self.open_button.set_sensitive(bool(self.get_open_directory()))
 
@@ -334,7 +326,7 @@ class Label(Gtk.Label):
 
     def __init__(self, message=None, width_request=230):
         """Custom init of label."""
-        super().__init__(label=message)
+        super().__init__(label=message, visible=True)
         self.set_line_wrap(True)
         self.set_max_width_chars(22)
         self.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
@@ -348,16 +340,12 @@ class VBox(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, margin_top=18, **kwargs)
 
 
-class EditableGrid(Gtk.Grid):
+class EditableGrid(Gtk.Box):
     __gsignals__ = {"changed": (GObject.SIGNAL_RUN_FIRST, None, ())}
 
     def __init__(self, data, columns):
         self.columns = columns
-        super().__init__()
-        self.set_column_homogeneous(True)
-        self.set_row_homogeneous(True)
-        self.set_row_spacing(6)
-        self.set_column_spacing(6)
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 
         self.liststore = Gtk.ListStore(str, str)
         for item in data:
@@ -386,14 +374,16 @@ class EditableGrid(Gtk.Grid):
         self.delete_button.connect("clicked", self.on_delete)
 
         self.scrollable_treelist = Gtk.ScrolledWindow()
-        self.scrollable_treelist.set_vexpand(True)
+        self.scrollable_treelist.set_size_request(-1, 209)
         self.scrollable_treelist.add(self.treeview)
         self.scrollable_treelist.set_shadow_type(Gtk.ShadowType.IN)
 
-        self.attach(self.scrollable_treelist, 0, 0, 5, 5)
-        self.attach(self.add_button, 5 - len(self.buttons), 6, 1, 1)
-        for i, button in enumerate(self.buttons[1:]):
-            self.attach_next_to(button, self.buttons[i], Gtk.PositionType.RIGHT, 1, 1)
+        self.pack_start(self.scrollable_treelist, True, True, 0)
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for button in reversed(self.buttons):
+            button.set_size_request(80, -1)
+            button_box.pack_end(button, False, False, 0)
+        self.pack_end(button_box, False, False, 0)
         self.show_all()
 
     def on_add(self, widget):  # pylint: disable=unused-argument

@@ -10,15 +10,16 @@ import string
 import subprocess
 import zipfile
 from collections import defaultdict
-from functools import lru_cache
 from gettext import gettext as _
 from pathlib import Path
 
 from gi.repository import Gio, GLib
 
 from lutris import settings
+from lutris.exceptions import MissingExecutableError
 from lutris.util.jobs import AsyncCall
 from lutris.util.log import logger
+from lutris.util.portals import TrashPortal
 
 # Home folders that should never get deleted.
 PROTECTED_HOME_FOLDERS = (
@@ -46,22 +47,51 @@ FALLBACK_VULKAN_DATA_DIRS = [
 ]
 
 
-def execute(command, env=None, cwd=None, capture_stderr=False, quiet=False, shell=False, timeout=None):
+def get_environment():
+    """Return a safe to use copy of the system's environment.
+    Values starting with BASH_FUNC can cause issues when written in a text file."""
+    return {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("BASH_FUNC")
+    }
+
+
+def execute(command, env=None, cwd=None, quiet=False, shell=False, timeout=None):
     """
-        Execute a system command and return its results.
+       Execute a system command and return its standard output; standard error is discarded.
 
-        Params:
-            command (list): A list containing an executable and its parameters
-            env (dict): Dict of values to add to the current environment
-            cwd (str): Working directory
-            capture_stderr (bool): Append stderr to stdout (might cause slowdowns)
-            quiet (bool): Do not display log messages
-            timeout (int): Number of seconds the program is allowed to run, disabled by default
+       Params:
+           command (list): A list containing an executable and its parameters
+           env (dict): Dict of values to add to the current environment
+           cwd (str): Working directory
+           quiet (bool): Do not display log messages
+           timeout (int): Number of seconds the program is allowed to run, disabled by default
 
-        Returns:
-            str: stdout output
+       Returns:
+           str: stdout output
     """
+    stdout, _stderr = _execute(command, env=env, cwd=cwd, quiet=quiet, shell=shell, timeout=timeout)
+    return stdout
 
+
+def execute_with_error(command, env=None, cwd=None, quiet=False, shell=False, timeout=None):
+    """
+       Execute a system command and return its standard output and; standard error in a tuple.
+
+       Params:
+           command (list): A list containing an executable and its parameters
+           env (dict): Dict of values to add to the current environment
+           cwd (str): Working directory
+           quiet (bool): Do not display log messages
+           timeout (int): Number of seconds the program is allowed to run, disabled by default
+
+       Returns:
+           str: stdout output
+    """
+    return _execute(command, env=env, cwd=cwd, capture_stderr=True, quiet=quiet, shell=shell, timeout=timeout)
+
+
+def _execute(command, env=None, cwd=None, capture_stderr=False, quiet=False, shell=False, timeout=None):
     # Check if the executable exists
     if not command:
         logger.error("No executable provided!")
@@ -74,7 +104,7 @@ def execute(command, env=None, cwd=None, capture_stderr=False, quiet=False, shel
         logger.debug("Executing %s", " ".join([str(i) for i in command]))
 
     # Set up environment
-    existing_env = os.environ.copy()
+    existing_env = get_environment()
     if env:
         if not quiet:
             logger.debug(" ".join("{}={}".format(k, v) for k, v in env.items()))
@@ -101,10 +131,7 @@ def execute(command, env=None, cwd=None, capture_stderr=False, quiet=False, shel
         logger.error("Command %s after %s seconds", command, timeout)
         return ""
 
-    if stderr:
-        return (stdout + stderr).strip()
-
-    return stdout.strip()
+    return stdout.strip(), (stderr or "").strip()
 
 
 def spawn(command, env=None, cwd=None, quiet=False, shell=False):
@@ -131,7 +158,7 @@ def spawn(command, env=None, cwd=None, quiet=False, shell=False):
         logger.debug("Spawning %s", " ".join([str(i) for i in command]))
 
     # Set up environment
-    existing_env = os.environ.copy()
+    existing_env = get_environment()
     if env:
         if not quiet:
             logger.debug(" ".join("{}={}".format(k, v) for k, v in env.items()))
@@ -215,11 +242,21 @@ def make_executable(exec_path):
     os.chmod(exec_path, file_stats.st_mode | stat.S_IEXEC)
 
 
-def find_executable(exec_name):
-    """Return the absolute path of an executable"""
-    if not exec_name:
-        return None
-    return shutil.which(exec_name)
+def can_find_executable(exec_name: str) -> bool:
+    """Checks if an executable can be located; if false,
+    find_executable will raise an exception."""
+    return bool(exec_name) and bool(shutil.which(exec_name))
+
+
+def find_executable(exec_name: str) -> str:
+    """Return the absolute path of an executable, but raises a
+    MissingExecutableError if it could not be found."""
+    if exec_name:
+        exe = shutil.which(exec_name)
+        if exe:
+            return exe
+
+    raise MissingExecutableError(_("The executable '%s' could not be found.") % exec_name)
 
 
 def get_pid(program, multiple=False):
@@ -313,20 +350,45 @@ def merge_folders(source, destination):
             shutil.copy(os.path.join(dirpath, filename), os.path.join(dst_abspath, filename), follow_symlinks=False)
 
 
-def remove_folder(path):
-    """Delete a folder specified by path
-    Returns true if the folder was successfully removed.
+def remove_folder(path: str,
+                  completion_function: TrashPortal.CompletionFunction = None,
+                  error_function: TrashPortal.ErrorFunction = None) -> None:
+    """Trashes a folder specified by path, asynchronously. The folder
+    likely exists after this returns, since it's using DBus to ask
+    for the entrashification.
+    """
+    if not os.path.exists(path):
+        logger.warning("Non existent path: %s", path)
+        if completion_function:
+            completion_function()
+        return
+    if os.path.samefile(os.path.expanduser("~"), path):
+        if error_function:
+            error_function(RuntimeError("Lutris tried to trash home directory!"))
+        return
+
+    logger.debug("Trashing folder %s", path)
+    TrashPortal(path,
+                completion_function=completion_function,
+                error_function=error_function)
+
+
+def delete_folder(path):
+    """Delete a folder specified by path immediately. The folder will not
+    be recoverable, so consider remove_folder() instead.
+
+    Returns true if the folder was successfully deleted.
     """
     if not os.path.exists(path):
         logger.warning("Non existent path: %s", path)
         return False
-    logger.debug("Removing folder %s", path)
     if os.path.samefile(os.path.expanduser("~"), path):
         raise RuntimeError("Lutris tried to erase home directory!")
+    logger.debug("Deleting folder %s", path)
     try:
         shutil.rmtree(path)
     except OSError as ex:
-        logger.error("Failed to remove folder %s: %s (Error code %s)", path, ex.strerror, ex.errno)
+        logger.error("Failed to delete folder %s: %s (Error code %s)", path, ex.strerror, ex.errno)
         return False
     return True
 
@@ -410,8 +472,9 @@ def get_pids_using_file(path):
     if not os.path.exists(path):
         logger.error("Can't return PIDs using non existing file: %s", path)
         return set()
-    fuser_path = find_executable("fuser")
-    if not fuser_path:
+    try:
+        fuser_path = find_executable("fuser")
+    except MissingExecutableError:
         logger.warning("fuser not available, please install psmisc")
         return set([])
     fuser_output = execute([fuser_path, path], quiet=True)
@@ -447,7 +510,7 @@ def path_contains(parent, child, resolve_symlinks=False):
     return resolved_child == resolved_parent or resolved_parent in resolved_child.parents
 
 
-def path_exists(path, check_symlinks=False, exclude_empty=False):
+def path_exists(path: str, check_symlinks: bool = False, exclude_empty: bool = False) -> bool:
     """Wrapper around system.path_exists that doesn't crash with empty values
 
     Params:
@@ -467,6 +530,19 @@ def path_exists(path, check_symlinks=False, exclude_empty=False):
         logger.warning("%s is a broken link", path)
         return not check_symlinks
     return False
+
+
+def create_symlink(source: str, destination: str):
+    """Create a symlink from source to destination.
+    If there is already a symlink at the destination and it is broken, it will be deleted."""
+    is_directory = os.path.isdir(source)
+    if os.path.islink(destination) and not os.path.exists(destination):
+        logger.warning("Deleting broken symlink %s", destination)
+        os.remove(destination)
+    try:
+        os.symlink(source, destination, target_is_directory=is_directory)
+    except OSError:
+        logger.error("Failed linking %s to %s", source, destination)
 
 
 def reset_library_preloads():
@@ -494,7 +570,7 @@ def update_desktop_icons():
     """Update Icon for GTK+ desktop manager
     Other desktop manager icon cache commands must be added here if needed
     """
-    if find_executable("gtk-update-icon-cache"):
+    if can_find_executable("gtk-update-icon-cache"):
         execute(["gtk-update-icon-cache", "-tf", os.path.join(GLib.get_user_data_dir(), "icons/hicolor")], quiet=True)
         execute(["gtk-update-icon-cache", "-tf", os.path.join(settings.RUNTIME_DIR, "icons/hicolor")], quiet=True)
 
@@ -569,27 +645,35 @@ def set_keyboard_layout(layout):
             xkbcomp.communicate()
 
 
-def preload_vulkan_gpu_names(use_dri_prime):
+_vulkan_gpu_names = {}
+
+
+def get_vulkan_gpu_name(icd_files, use_dri_prime):
+    """Retrieves the GPU name associated with a set of ICD files; this does not generate
+    this data as it can be quite slow, and we use this in the UI where we do not want to
+    freeze. We load the GPU names in the background, until they are ready this returns
+    'Not Ready'."""
+    key = icd_files, use_dri_prime
+    return _vulkan_gpu_names.get(key, _("GPU Info Not Ready"))
+
+
+def load_vulkan_gpu_names(use_dri_prime):
     """Runs threads to load the GPU data from vulkan info for each ICD file set,
-    and one for the default 'unspecified' info. The results are cached by @lru_cache,
-    so we can just ignore them here."""
+    and one for the default 'unspecified' info."""
 
     try:
         all_files = [":".join(fs) for fs in get_vk_icd_file_sets().values()]
         all_files.append("")
         for files in all_files:
-            # ignore any errors from get_vulkan_gpu_name
-            AsyncCall(get_vulkan_gpu_name, None, files, use_dri_prime, daemon=True)
+            AsyncCall(_load_vulkan_gpu_name, None, files, use_dri_prime, daemon=True)
     except Exception as ex:
         logger.exception("Failed to preload Vulkan GPU Names: %s", ex)
 
 
-# cache this to avoid calling vulkaninfo repeatedly, shouldn't change at runtime
-@lru_cache()
-def get_vulkan_gpu_name(icd_files, use_dri_prime):
+def _load_vulkan_gpu_name(icd_files, use_dri_prime):
     """Runs vulkaninfo to determine the default and DRI_PRIME gpu if available,
     returns 'Not Found' if the GPU is not found or 'Unknown GPU' if vulkaninfo
-    is not available."""
+    is not available or an error occurs trying to use it."""
 
     def fetch_vulkan_gpu_name(prime):
         """Runs vulkaninfo to find the primary GPU"""
@@ -615,18 +699,28 @@ def get_vulkan_gpu_name(icd_files, use_dri_prime):
         # AMD Radeon Pro W6800 (RADV NAVI21) -> AMD Radeon Pro W6800
         return re.sub(r"\s*\(.*?\)", "", result)
 
-    if not shutil.which("vulkaninfo"):
-        logger.warning("vulkaninfo not available, unable to list GPUs")
-        return "Unknown GPU"
+    def get_name():
+        try:
+            if not shutil.which("vulkaninfo"):
+                logger.warning("vulkaninfo not available, unable to list GPUs")
+                return _("Unknown GPU")
 
-    gpu = fetch_vulkan_gpu_name(False)
+            gpu = fetch_vulkan_gpu_name(False)
 
-    if use_dri_prime:
-        prime_gpu = fetch_vulkan_gpu_name(True)
-        if prime_gpu != gpu:
-            gpu += f" (Discrete GPU: {prime_gpu})"
+            if use_dri_prime:
+                prime_gpu = fetch_vulkan_gpu_name(True)
+                if prime_gpu != gpu:
+                    gpu += _(" (Discrete GPU: %s)") % prime_gpu
 
-    return gpu or "Not Found"
+            return gpu or "Not Found"
+        except Exception as ex:
+            # Must not raise an exception as we do not cache them, and
+            # this function must be preloaded, or it can slow down the UI.
+            logger.exception("Fail to load Vulkan GPU names: %s", ex)
+            return _("Unknown GPU")
+
+    key = icd_files, use_dri_prime
+    _vulkan_gpu_names[key] = get_name()
 
 
 def get_vk_icd_file_sets():

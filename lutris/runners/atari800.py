@@ -3,6 +3,7 @@ import os.path
 from gettext import gettext as _
 
 from lutris.config import LutrisConfig
+from lutris.exceptions import MissingBiosError, MissingGameExecutableError
 from lutris.runners.runner import Runner
 from lutris.util import display, extract, system
 
@@ -113,7 +114,7 @@ class atari800(Runner):
         return good_bios
 
     def play(self):
-        arguments = [self.get_executable()]
+        arguments = self.get_command()
         if self.runner_config.get("fullscreen"):
             arguments.append("-fullscreen")
         else:
@@ -132,7 +133,7 @@ class atari800(Runner):
 
         bios_path = self.runner_config.get("bios_path")
         if not system.path_exists(bios_path):
-            return {"error": "NO_BIOS"}
+            raise MissingBiosError()
         good_bios = self.find_good_bioses(bios_path)
         for bios, filename in good_bios.items():
             arguments.append("-%s" % bios)
@@ -140,7 +141,7 @@ class atari800(Runner):
 
         rom = self.game_config.get("main_file") or ""
         if not system.path_exists(rom):
-            return {"error": "FILE_NOT_FOUND", "file": rom}
+            raise MissingGameExecutableError(filename=rom)
         arguments.append(rom)
 
         return {"command": arguments}

@@ -43,6 +43,7 @@ class XDGService(BaseService):
     id = "xdg"
     name = _("Local")
     icon = "linux"
+    runner = "linux"
     online = False
     local = True
     medias = {
@@ -89,7 +90,8 @@ class XDGService(BaseService):
             return False
 
         # contains a blacklisted category
-        if bool([category for category in categories if category in map(str.lower, cls.ignored_categories)]):
+        ignored_categories = set(c.casefold() for c in cls.ignored_categories)
+        if any(c for c in categories if c in ignored_categories):
             return False
         return True
 
@@ -110,8 +112,8 @@ class XDGService(BaseService):
             "name": db_game["name"],
             "version": "XDG",
             "slug": db_game["slug"],
-            "game_slug": slugify(db_game["name"]),
-            "runner": "linux",
+            "game_slug": self.get_installed_slug(db_game),
+            "runner": self.get_installed_runner_name(db_game),
             "script": {
                 "game": {
                     "exe": details["exe"],
@@ -120,6 +122,9 @@ class XDGService(BaseService):
                 "system": {"disable_runtime": True}
             }
         }
+
+    def get_installed_runner_name(self, db_game):
+        return self.runner
 
     def get_game_directory(self, installer):
         """Pull install location from installer"""

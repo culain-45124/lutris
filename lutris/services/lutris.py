@@ -2,6 +2,7 @@ import json
 import os
 import urllib.parse
 from gettext import gettext as _
+from typing import Dict, Iterable, List
 
 from gi.repository import Gio
 
@@ -9,11 +10,13 @@ from lutris import settings
 from lutris.api import get_api_games, get_game_installers, read_api_key
 from lutris.database.games import get_games
 from lutris.database.services import ServiceGameCollection
+from lutris.game import Game
 from lutris.gui import dialogs
 from lutris.gui.views.media_loader import download_media
 from lutris.services.base import LutrisBanner, LutrisCoverart, LutrisCoverartMedium, LutrisIcon, OnlineService
 from lutris.services.service_game import ServiceGame
 from lutris.util import http
+from lutris.util.jobs import AsyncCall
 from lutris.util.log import logger
 
 
@@ -112,23 +115,52 @@ class LutrisService(OnlineService):
         # but are not in the Lutris library.
         sync_media()
 
-    def install(self, db_game):
-        if isinstance(db_game, dict):
-            slug = db_game["slug"]
-        else:
-            slug = db_game
-        installers = get_game_installers(slug)
-        if not installers:
-            raise RuntimeError(_("Lutris has no installers for %s. Try using a different service instead.") % slug)
-        application = Gio.Application.get_default()
-        application.show_installer_window(installers)
+    def get_installed_slug(self, db_game):
+        return db_game["slug"]
 
-    def get_game_platforms(self, db_game):
+    def install(self, db_game):
+        slug = db_game["slug"]
+        return self.install_by_id(slug)
+
+    def install_by_id(self, appid):
+        def on_installers_ready(installers, error):
+            if error:
+                raise error  # bounce any error off the backstop
+            if not installers:
+                raise RuntimeError(_("Lutris has no installers for %s. Try using a different service instead.") % appid)
+            application = Gio.Application.get_default()
+            application.show_installer_window(installers)
+
+        AsyncCall(get_game_installers, on_installers_ready, appid)  # appid is the slug for Lutris games
+
+    def get_installed_runner_name(self, db_game):
+        platforms = self.get_game_platforms(db_game)
+
+        if platforms and len(platforms) == 1:
+            platform = platforms[0].casefold()
+
+            if platform == "windows":
+                return "wine"
+
+            if platform == "linux":
+                return "linux"
+
+            if platform == "ms-dos":
+                return "dosbox"
+
+        return ""
+
+    def get_game_platforms(self, db_game: dict) -> List[str]:
         details = db_game.get("details")
         if details:
             platforms = json.loads(details).get("platforms")
             if platforms is not None:
                 return [p.get("name") for p in platforms]
+        return []
+
+    def get_service_db_game(self, game: Game):
+        if game.service == self.id and game.slug:
+            return ServiceGameCollection.get_game(self.id, game.slug)
         return None
 
 
@@ -155,8 +187,17 @@ def download_lutris_media(slug):
         download_media({slug: cover_url}, LutrisCoverart())
 
 
-def sync_media():
-    """Downlad all missing media"""
+def sync_media(slugs: Iterable[str] = None) -> Dict[str, int]:
+    """Download missing media for Lutris games; if a set of slugs
+    is not provided, downloads them for all games in the PGA."""
+    if slugs is None:
+        slugs = {game["slug"] for game in get_games()}
+    else:
+        slugs = set(s for s in slugs if s)
+
+    if not slugs:
+        return {}
+
     banners_available = {fn.split(".")[0] for fn in os.listdir(settings.BANNER_PATH)}
     icons_available = {
         fn.split(".")[0].replace("lutris_", "")
@@ -165,18 +206,18 @@ def sync_media():
     }
     covers_available = {fn.split(".")[0] for fn in os.listdir(settings.COVERART_PATH)}
     complete_games = banners_available.intersection(icons_available).intersection(covers_available)
-    all_slugs = {game["slug"] for game in get_games()}
-    slugs = all_slugs - complete_games
-    if not slugs:
-        return
-    games = get_api_games(list(slugs))
+
+    slugs_to_download = slugs - complete_games
+    if not slugs_to_download:
+        return {}
+    games = get_api_games(list(slugs_to_download))
 
     alias_map = {}
     api_slugs = set()
     for game in games:
         api_slugs.add(game["slug"])
         for alias in game["aliases"]:
-            if alias["slug"] in slugs:
+            if alias["slug"] in slugs_to_download:
                 alias_map[game["slug"]] = alias["slug"]
     alias_slugs = set(alias_map.values())
     used_alias_slugs = alias_slugs - api_slugs
@@ -207,3 +248,8 @@ def sync_media():
     download_media(banner_urls, LutrisBanner())
     download_media(icon_urls, LutrisIcon())
     download_media(cover_urls, LutrisCoverart())
+    return {
+        "banners": len(banner_urls),
+        "icons": len(icon_urls),
+        "covers": len(cover_urls),
+    }

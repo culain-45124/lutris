@@ -3,12 +3,14 @@
 import enum
 import os
 import subprocess
-import gi
+from typing import Any, Dict
 
+import gi
 
 try:
     gi.require_version("GnomeDesktop", "3.0")
     from gi.repository import GnomeDesktop
+
     LIB_GNOME_DESKTOP_AVAILABLE = True
 except ValueError:
     LIB_GNOME_DESKTOP_AVAILABLE = False
@@ -16,6 +18,7 @@ except ValueError:
 
 try:
     from dbus.exceptions import DBusException
+
     DBUS_AVAILABLE = True
 except ImportError:
     DBUS_AVAILABLE = False
@@ -28,10 +31,7 @@ from lutris.util.graphics import drivers
 from lutris.util.graphics.displayconfig import MutterDisplayManager
 from lutris.util.graphics.xrandr import LegacyDisplayManager, change_resolution, get_outputs
 from lutris.util.log import logger
-
-
-class NoScreenDetected(Exception):
-    """Raise this when unable to detect screens"""
+from lutris.exceptions import MissingExecutableError
 
 
 def get_default_dpi():
@@ -86,11 +86,13 @@ def _get_graphics_adapters():
     Returns:
         list: list of tuples containing PCI ID and description of the display controller
     """
-    lspci_path = system.find_executable("lspci")
-    dev_subclasses = ["VGA", "XGA", "3D controller", "Display controller"]
-    if not lspci_path:
+    try:
+        lspci_path = system.find_executable("lspci")
+    except MissingExecutableError:
         logger.warning("lspci is not available. List of graphics cards not available")
         return []
+
+    dev_subclasses = ["VGA", "XGA", "3D controller", "Display controller"]
     return [
         (pci_id, device_desc.split(": ")[1]) for pci_id, device_desc in [
             line.split(maxsplit=1) for line in system.execute(lspci_path, timeout=3).split("\n")
@@ -102,13 +104,7 @@ def _get_graphics_adapters():
 class DisplayManager:
     """Get display and resolution using GnomeDesktop"""
 
-    def __init__(self):
-        if not LIB_GNOME_DESKTOP_AVAILABLE:
-            logger.warning("libgnomedesktop unavailable")
-            return
-        screen = Gdk.Screen.get_default()
-        if not screen:
-            raise NoScreenDetected
+    def __init__(self, screen: Gdk.Screen):
         self.rr_screen = GnomeDesktop.RRScreen.new(screen)
         self.rr_config = GnomeDesktop.RRConfig.new_current(self.rr_screen)
         self.rr_config.load_current()
@@ -122,7 +118,7 @@ class DisplayManager:
         resolutions = ["%sx%s" % (mode.get_width(), mode.get_height()) for mode in self.rr_screen.list_modes()]
         if not resolutions:
             logger.error("Failed to generate resolution list from default GdkScreen")
-            resolutions = ['%dx%d' % (DEFAULT_RESOLUTION_WIDTH, DEFAULT_RESOLUTION_HEIGHT)]
+            return ['%sx%s' % (DEFAULT_RESOLUTION_WIDTH, DEFAULT_RESOLUTION_HEIGHT)]
         return sorted(set(resolutions), key=lambda x: int(x.split("x")[0]), reverse=True)
 
     def _get_primary_output(self):
@@ -172,10 +168,13 @@ def get_display_manager():
             logger.exception("Failed to instantiate MutterDisplayConfig. Please report with exception: %s", ex)
     else:
         logger.error("DBus is not available, Lutris was not properly installed.")
+
     if LIB_GNOME_DESKTOP_AVAILABLE:
         try:
-            return DisplayManager()
-        except (GLib.Error, NoScreenDetected):
+            screen = Gdk.Screen.get_default()
+            if screen:
+                return DisplayManager(screen)
+        except GLib.Error:
             pass
     return LegacyDisplayManager()
 
@@ -185,7 +184,6 @@ USE_DRI_PRIME = len(list(drivers.get_gpus())) > 1
 
 
 class DesktopEnvironment(enum.Enum):
-
     """Enum of desktop environments."""
 
     PLASMA = 0
@@ -193,6 +191,60 @@ class DesktopEnvironment(enum.Enum):
     XFCE = 2
     DEEPIN = 3
     UNKNOWN = 999
+
+
+# These desktop environment use a compositor that can be detected with a specific
+# command, and which provide a definite answer; the DE can be asked to start and stop it..
+_compositor_commands_by_de = {
+    DesktopEnvironment.PLASMA: {
+        "check": ["qdbus", "org.kde.KWin", "/Compositor", "org.kde.kwin.Compositing.active"],
+        "active_result": b"true\n",
+        "stop_compositor": ["qdbus", "org.kde.KWin", "/Compositor", "org.kde.kwin.Compositing.suspend"],
+        "start_compositor": ["qdbus", "org.kde.KWin", "/Compositor", "org.kde.kwin.Compositing.resume"]
+    },
+    DesktopEnvironment.MATE: {
+        "check": ["gsettings", "get org.mate.Marco.general", "compositing-manager"],
+        "active_result": b"true\n",
+        "stop_compositor": ["gsettings", "set org.mate.Marco.general", "compositing-manager", "false"],
+        "start_compositor": ["gsettings", "set org.mate.Marco.general", "compositing-manager", "true"]
+    },
+    DesktopEnvironment.XFCE: {
+        "check": ["xfconf-query", "--channel=xfwm4", "--property=/general/use_compositing"],
+        "active_result": b"true\n",
+        "stop_compositor": ["xfconf-query", "--channel=xfwm4", "--property=/general/use_compositing", "--set=false"],
+        "start_compositor": ["xfconf-query", "--channel=xfwm4", "--property=/general/use_compositing", "--set=true"]
+    },
+    DesktopEnvironment.DEEPIN: {
+        "check": ["dbus-send", "--session", "--dest=com.deepin.WMSwitcher", "--type=method_call",
+                  "--print-reply=literal", "/com/deepin/WMSwitcher", "com.deepin.WMSwitcher.CurrentWM"],
+        "active_result": b"deepin wm\n",
+        "stop_compositor": [
+            "dbus-send", "--session", "--dest=com.deepin.WMSwitcher", "--type=method_call",
+            "/com/deepin/WMSwitcher", "com.deepin.WMSwitcher.RequestSwitchWM"
+        ],
+        "start_compositor": [
+            "dbus-send", "--session", "--dest=com.deepin.WMSwitcher", "--type=method_call",
+            "/com/deepin/WMSwitcher", "com.deepin.WMSwitcher.RequestSwitchWM"
+        ],
+    },
+}
+
+# These additional compositors can be detected by looking for their process,
+# and must be started more directly.
+_non_de_compositor_commands = [
+    {
+        "check": ["pgrep", "picom"],
+        "stop_compositor": ["pkill", "picom"],
+        "start_compositor": ["picom", ""],
+        "run_in_background": True
+    },
+    {
+        "check": ["pgrep", "compton"],
+        "stop_compositor": ["pkill", "compton"],
+        "start_compositor": ["compton", ""],
+        "run_in_background": True
+    }
+]
 
 
 def get_desktop_environment():
@@ -214,7 +266,7 @@ def get_desktop_environment():
     return DesktopEnvironment.UNKNOWN
 
 
-def _get_command_output(*command):
+def _get_command_output(command):
     """Some rogue function that gives no shit about residing in the correct module"""
     try:
         return subprocess.Popen(  # pylint: disable=consider-using-with
@@ -231,23 +283,31 @@ def is_compositing_enabled():
     """Checks whether compositing is currently disabled or enabled.
     Returns True for enabled, False for disabled, and None if unknown.
     """
+
     desktop_environment = get_desktop_environment()
-    if desktop_environment is DesktopEnvironment.PLASMA:
-        return _get_command_output(
-            "qdbus", "org.kde.KWin", "/Compositor", "org.kde.kwin.Compositing.active"
-        ) == b"true\n"
-    if desktop_environment is DesktopEnvironment.MATE:
-        return _get_command_output("gsettings", "get org.mate.Marco.general", "compositing-manager") == b"true\n"
-    if desktop_environment is DesktopEnvironment.XFCE:
-        return _get_command_output(
-            "xfconf-query", "--channel=xfwm4", "--property=/general/use_compositing"
-        ) == b"true\n"
-    if desktop_environment is DesktopEnvironment.DEEPIN:
-        return _get_command_output(
-            "dbus-send", "--session", "--dest=com.deepin.WMSwitcher", "--type=method_call",
-            "--print-reply=literal", "/com/deepin/WMSwitcher", "com.deepin.WMSwitcher.CurrentWM"
-        ) == b"deepin wm\n"
+    if desktop_environment in _compositor_commands_by_de:
+        command_set = _compositor_commands_by_de[desktop_environment]
+        return _check_compositor_active(command_set)
+
+    for command_set in _non_de_compositor_commands:
+        if _check_compositor_active(command_set):
+            return True
+
+    # It might be a compositor we don't know about, so return None for unknown.
     return None
+
+
+def _check_compositor_active(command_set: Dict[str, Any]) -> bool:
+    """Applies the 'check' command; and returns whether the result
+    was the desired 'active_result'; if that is omitted, we check for
+    any result at all."""
+    command = command_set["check"]
+    result = _get_command_output(command)
+
+    if "active_result" in command_set:
+        return result == command_set["active_result"]
+
+    return result != b''
 
 
 # One element is appended to this for every invocation of disable_compositing:
@@ -259,41 +319,44 @@ _COMPOSITING_DISABLED_STACK = []
 
 def _get_compositor_commands():
     """Returns the commands to enable/disable compositing on the current
-    desktop environment as a 2-tuple.
+    desktop environment as a 3-tuple: start command, stop-command and
+    a flag to indicate if we need to run the commands in the background.
     """
-    start_compositor = None
-    stop_compositor = None
     desktop_environment = get_desktop_environment()
-    if desktop_environment is DesktopEnvironment.PLASMA:
-        stop_compositor = ("qdbus", "org.kde.KWin", "/Compositor", "org.kde.kwin.Compositing.suspend")
-        start_compositor = ("qdbus", "org.kde.KWin", "/Compositor", "org.kde.kwin.Compositing.resume")
-    elif desktop_environment is DesktopEnvironment.MATE:
-        stop_compositor = ("gsettings", "set org.mate.Marco.general", "compositing-manager", "false")
-        start_compositor = ("gsettings", "set org.mate.Marco.general", "compositing-manager", "true")
-    elif desktop_environment is DesktopEnvironment.XFCE:
-        stop_compositor = ("xfconf-query", "--channel=xfwm4", "--property=/general/use_compositing", "--set=false")
-        start_compositor = ("xfconf-query", "--channel=xfwm4", "--property=/general/use_compositing", "--set=true")
-    elif desktop_environment is DesktopEnvironment.DEEPIN:
-        start_compositor = (
-            "dbus-send", "--session", "--dest=com.deepin.WMSwitcher", "--type=method_call",
-            "/com/deepin/WMSwitcher", "com.deepin.WMSwitcher.RequestSwitchWM",
-        )
-        stop_compositor = start_compositor
-    return start_compositor, stop_compositor
+    command_set = _compositor_commands_by_de.get(desktop_environment)
+
+    if not command_set:
+        for c in _non_de_compositor_commands:
+            if _check_compositor_active(c):
+                command_set = c
+                break
+
+    if command_set:
+        start_compositor = command_set["start_compositor"]
+        stop_compositor = command_set["stop_compositor"]
+        run_in_background = bool(command_set.get("run_in_background"))
+        return start_compositor, stop_compositor, run_in_background
+
+    return None, None, False
 
 
-def _run_command(*command):
+def _run_command(*command, run_in_background=False):
     """Random _run_command lost in the middle of the project,
     are you lost little _run_command?
     """
     try:
+        if run_in_background:
+            command = ' '.join(command)
         return subprocess.Popen(  # pylint: disable=consider-using-with
             command,
             stdin=subprocess.DEVNULL,
-            close_fds=True
+            close_fds=True,
+            shell=run_in_background,
+            start_new_session=run_in_background
         )
     except FileNotFoundError:
-        logger.error("Oh no")
+        errorMessage = "FileNotFoundError when running command:", command
+        logger.error(errorMessage)
 
 
 def disable_compositing():
@@ -306,9 +369,9 @@ def disable_compositing():
     _COMPOSITING_DISABLED_STACK.append(compositing_enabled)
     if not compositing_enabled:
         return
-    _, stop_compositor = _get_compositor_commands()
+    _, stop_compositor, background = _get_compositor_commands()
     if stop_compositor:
-        _run_command(*stop_compositor)
+        _run_command(*stop_compositor, run_in_background=background)
 
 
 def enable_compositing():
@@ -318,13 +381,12 @@ def enable_compositing():
     compositing_disabled = _COMPOSITING_DISABLED_STACK.pop()
     if not compositing_disabled:
         return
-    start_compositor, _ = _get_compositor_commands()
+    start_compositor, _, background = _get_compositor_commands()
     if start_compositor:
-        _run_command(*start_compositor)
+        _run_command(*start_compositor, run_in_background=background)
 
 
 class DBusScreenSaverInhibitor:
-
     """Inhibit and uninhibit the screen saver using DBus.
 
     It will use the Gtk.Application's inhibit and uninhibit methods to inhibit

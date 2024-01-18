@@ -5,8 +5,8 @@ from gettext import gettext as _
 
 from gi.repository import Gio, GLib, Gtk
 
+from lutris import settings
 from lutris.config import LutrisConfig
-from lutris.exceptions import watch_errors
 from lutris.game import Game
 from lutris.gui.dialogs import DirectoryDialog, ErrorDialog, InstallerSourceDialog, ModelessDialog, QuestionDialog
 from lutris.gui.dialogs.cache import CacheConfigurationDialog
@@ -16,14 +16,29 @@ from lutris.gui.installer.script_picker import InstallerPicker
 from lutris.gui.widgets.common import FileChooserEntry
 from lutris.gui.widgets.log_text_view import LogTextView
 from lutris.gui.widgets.navigation_stack import NavigationStack
-from lutris.installer import InstallationKind, get_installers, interpreter
-from lutris.installer.errors import MissingGameDependency, ScriptingError
+from lutris.installer import InstallationKind, interpreter
+from lutris.installer.errors import MissingGameDependencyError, ScriptingError
 from lutris.installer.interpreter import ScriptInterpreter
 from lutris.util import xdgshortcuts
+from lutris.util.jobs import AsyncCall
+from lutris.util.linux import LINUX_SYSTEM
 from lutris.util.log import logger
 from lutris.util.steam import shortcut as steam_shortcut
-from lutris.util.strings import gtk_safe, human_size
+from lutris.util.strings import human_size
 from lutris.util.system import is_removeable
+
+
+class MarkupLabel(Gtk.Label):
+    """Label for installer window"""
+
+    def __init__(self, markup=None, **kwargs):
+        super().__init__(
+            label=markup,
+            use_markup=True,
+            wrap=True,
+            max_width_chars=80,
+            **kwargs)
+        self.set_alignment(0.5, 0)
 
 
 class InstallerWindow(ModelessDialog,
@@ -55,6 +70,7 @@ class InstallerWindow(ModelessDialog,
         self.set_default_size(740, 460)
         self.installers = installers
         self.config = {}
+        self.selected_extras = []
         self.install_in_progress = False
         self.install_complete = False
         self.interpreter = None
@@ -73,7 +89,7 @@ class InstallerWindow(ModelessDialog,
         content_area.set_spacing(12)
 
         # Header labels
-        self.status_label = InstallerWindow.MarkupLabel(no_show_all=True)
+        self.status_label = MarkupLabel(no_show_all=True)
         content_area.pack_start(self.status_label, False, False, 0)
 
         # Header bar buttons
@@ -121,14 +137,15 @@ class InstallerWindow(ModelessDialog,
         self.extras_tree_store = Gtk.TreeStore(
             bool,  # is selected?
             bool,  # is inconsistent?
-            str,   # id
-            str,   # label
+            object,  # extras dict
+            str,  # label
         )
 
         self.location_entry = FileChooserEntry(
             "Select folder",
             Gtk.FileChooserAction.SELECT_FOLDER,
             warn_if_non_empty=True,
+            warn_if_non_writable_parent=True,
             warn_if_ntfs=True
         )
         self.location_entry.connect("changed", self.on_location_entry_changed)
@@ -186,23 +203,22 @@ class InstallerWindow(ModelessDialog,
         self.menu_box.pack_start(button, False, False, 0)
         return button
 
-    @watch_errors()
     def on_cache_clicked(self, _button):
         """Open the cache configuration dialog"""
         CacheConfigurationDialog(parent=self)
 
-    @watch_errors()
+    def on_response(self, dialog, response: Gtk.ResponseType) -> None:
+        if response in (Gtk.ResponseType.CLOSE, Gtk.ResponseType.CANCEL, Gtk.ResponseType.DELETE_EVENT):
+            self.on_cancel_clicked()
+        else:
+            super().on_response(dialog, response)
+
     def on_back_clicked(self, _button):
         self.stack.navigate_back()
 
-    @watch_errors()
     def on_navigate_home(self, _accel_group, _window, _keyval, _modifier):
         self.stack.navigate_home()
 
-    def on_destroy(self, _widget, _data=None):
-        self.on_cancel_clicked()
-
-    @watch_errors()
     def on_cancel_clicked(self, _button=None):
         """Ask a confirmation before cancelling the installation, if it has started."""
         if self.install_in_progress:
@@ -239,7 +255,6 @@ class InstallerWindow(ModelessDialog,
             self.interpreter.cleanup()  # still remove temporary downloads in any case
         self.destroy()
 
-    @watch_errors()
     def on_source_clicked(self, _button):
         InstallerSourceDialog(
             self.interpreter.installer.script_pretty,
@@ -247,9 +262,18 @@ class InstallerWindow(ModelessDialog,
             self
         )
 
-    def on_watched_error(self, error):
-        ErrorDialog(error, parent=self)
-        self.stack.navigation_reset()
+    def on_signal_error(self, error):
+        self._handle_callback_error(error)
+
+    def on_idle_error(self, error):
+        self._handle_callback_error(error)
+
+    def _handle_callback_error(self, error):
+        if self.install_in_progress:
+            self.load_error_message_page(str(error))
+        else:
+            ErrorDialog(error, parent=self)
+            self.stack.navigation_reset()
 
     def set_status(self, text):
         """Display a short status text."""
@@ -312,11 +336,10 @@ class InstallerWindow(ModelessDialog,
     def present_choose_installer_page(self):
         """Stage where we choose an install script."""
         self.set_status("")
-        self.set_title(_("Install %s") % gtk_safe(self.installers[0]["name"]))
+        self.set_title(_("Install %s") % self.installers[0]["name"])
         self.stack.present_page("choose_installer")
         self.display_cancel_button(extra_buttons=[self.cache_button])
 
-    @watch_errors()
     def on_installer_selected(self, _widget, installer_version):
         """Sets the script interpreter to the correct script then proceed to
         install folder selection.
@@ -331,7 +354,7 @@ class InstallerWindow(ModelessDialog,
                     script = _script
             self.interpreter = interpreter.ScriptInterpreter(script, self)
             self.interpreter.connect("runners-installed", self.on_runners_ready)
-        except MissingGameDependency as ex:
+        except MissingGameDependencyError as ex:
             dlg = QuestionDialog(
                 {
                     "parent": self,
@@ -340,12 +363,11 @@ class InstallerWindow(ModelessDialog,
                 }
             )
             if dlg.result == Gtk.ResponseType.YES:
-                installers = get_installers(game_slug=ex.slug)
                 application = Gio.Application.get_default()
-                application.show_installer_window(installers)
+                application.show_lutris_installer_window(game_slug=ex.slug)
             return
 
-        self.set_title(_("Installing {}").format(gtk_safe(self.interpreter.installer.game_name)))
+        self.set_title(_("Installing {}").format(self.interpreter.installer.game_name))
         self.load_destination_page()
 
     def validate_scripts(self, installers):
@@ -380,19 +402,29 @@ class InstallerWindow(ModelessDialog,
         self.continue_button.grab_focus()
 
     def create_destination_page(self):
+        installer_create_desktop_shortcut = settings.read_bool_setting("installer_create_desktop_shortcut", False)
+        installer_create_menu_shortcut = settings.read_bool_setting("installer_create_menu_shortcut", False)
+
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         vbox.pack_start(self.location_entry, False, False, 0)
 
         desktop_shortcut_button = Gtk.CheckButton(_("Create desktop shortcut"), visible=True)
+        desktop_shortcut_button.set_active(installer_create_desktop_shortcut)
         desktop_shortcut_button.connect("clicked", self.on_create_desktop_shortcut_clicked)
+        self.config["create_desktop_shortcut"] = installer_create_desktop_shortcut
+
         vbox.pack_start(desktop_shortcut_button, False, False, 0)
 
         menu_shortcut_button = Gtk.CheckButton(_("Create application menu shortcut"), visible=True)
+        menu_shortcut_button.set_active(installer_create_menu_shortcut)
         menu_shortcut_button.connect("clicked", self.on_create_menu_shortcut_clicked)
+        self.config["create_menu_shortcut"] = installer_create_menu_shortcut
+
         vbox.pack_start(menu_shortcut_button, False, False, 0)
 
         if steam_shortcut.vdf_file_exists():
             steam_shortcut_button = Gtk.CheckButton(_("Create steam shortcut"), visible=True)
+            steam_shortcut_button.set_active(settings.read_bool_setting("installer_create_steam_shortcut", False))
             steam_shortcut_button.connect("clicked", self.on_create_steam_shortcut_clicked)
             vbox.pack_start(steam_shortcut_button, False, False, 0)
         return vbox
@@ -405,41 +437,36 @@ class InstallerWindow(ModelessDialog,
         self.display_continue_button(self.on_destination_confirmed,
                                      extra_buttons=[self.cache_button, self.source_button])
 
-    @watch_errors()
     def on_destination_confirmed(self, _button=None):
         """Let the interpreter take charge of the next stages."""
 
-        @watch_errors(handler_object=self)
         def launch_install():
-            # This is a shim method to allow exceptions from
-            # the interpreter to be reported via watch_errors().
             if not self.interpreter.launch_install(self):
                 self.stack.navigation_reset()
 
-        self.load_spinner_page(_("Preparing Lutris for installation"), cancellable=False,
+        self.load_spinner_page(_("Preparing Lutris for installation"),
+                               cancellable=False,
                                extra_buttons=[self.cache_button, self.source_button])
         GLib.idle_add(launch_install)
 
-    @watch_errors()
     def on_location_entry_changed(self, entry, _data=None):
         """Set the installation target for the game."""
         self.interpreter.target_path = os.path.expanduser(entry.get_text())
 
-    @watch_errors()
     def on_create_desktop_shortcut_clicked(self, checkbutton):
+        settings.write_setting("installer_create_desktop_shortcut", checkbutton.get_active())
         self.config["create_desktop_shortcut"] = checkbutton.get_active()
 
-    @watch_errors()
     def on_create_menu_shortcut_clicked(self, checkbutton):
+        settings.write_setting("installer_create_menu_shortcut", checkbutton.get_active())
         self.config["create_menu_shortcut"] = checkbutton.get_active()
 
-    @watch_errors()
     def on_create_steam_shortcut_clicked(self, checkbutton):
+        settings.write_setting("installer_create_steam_shortcut", checkbutton.get_active())
         self.config["create_steam_shortcut"] = checkbutton.get_active()
 
-    @watch_errors()
     def on_runners_ready(self, _widget=None):
-        self.load_extras_page()
+        AsyncCall(self.interpreter.get_extras, self.on_extras_loaded)
 
     # Extras Page
     #
@@ -449,26 +476,29 @@ class InstallerWindow(ModelessDialog,
     # If there are no extras, the page triggers as if the user had clicked 'Continue',
     # moving on to pre-installation, then the installer files page.
 
-    def load_extras_page(self):
-        def get_extra_label(extra):
-            """Return a label for the extras picker"""
-            label = extra["name"]
-            _infos = []
-            if extra.get("total_size"):
-                _infos.append(human_size(extra["total_size"]))
-            if extra.get("type"):
-                _infos.append(extra["type"])
-            if _infos:
-                label += " (%s)" % ", ".join(_infos)
-            return label
+    def get_extra_label(self, extra):
+        """Return a label for the extras picker"""
+        label = extra["name"]
+        _infos = []
+        if extra.get("total_size"):
+            _infos.append(human_size(extra["total_size"]))
+        if extra.get("type"):
+            _infos.append(extra["type"])
+        if _infos:
+            label += " (%s)" % ", ".join(_infos)
+        return label
 
-        all_extras = self.interpreter.get_extras()
+    def on_extras_loaded(self, all_extras, error):
+        if error:
+            self._handle_callback_error(error)
+            return
+
         if all_extras:
             self.extras_tree_store.clear()
             for extra_source, extras in all_extras.items():
                 parent = self.extras_tree_store.append(None, (None, None, None, extra_source))
                 for extra in extras:
-                    self.extras_tree_store.append(parent, (False, False, extra["id"], get_extra_label(extra)))
+                    self.extras_tree_store.append(parent, (False, False, extra, self.get_extra_label(extra)))
 
             self.stack.navigate_to_page(self.present_extras_page)
         else:
@@ -500,6 +530,7 @@ class InstallerWindow(ModelessDialog,
 
     def present_extras_page(self):
         """Show installer screen with the extras picker"""
+        logger.debug("Showing extras page")
 
         def on_continue(_button):
             self.on_extras_confirmed(self.extras_tree_store)
@@ -511,7 +542,6 @@ class InstallerWindow(ModelessDialog,
         self.stack.present_page("extras")
         self.display_continue_button(on_continue, extra_buttons=[self.cache_button, self.source_button])
 
-    @watch_errors()
     def on_extra_toggled(self, _widget, path, model):
         toggled_row = model[path]
         toggled_row_iter = model.get_iter(path)
@@ -541,26 +571,22 @@ class InstallerWindow(ModelessDialog,
                 heading_row[0] = all_extras_active
                 heading_row[1] = any_extras_active
 
-    @watch_errors()
     def on_extras_confirmed(self, extra_store):
         """Resume install when user has selected extras to download"""
         selected_extras = []
 
         def save_extra(store, path, iter_):
-            selected, _inconsistent, id_, _label = store[iter_]
-            if selected and id_:
-                selected_extras.append(id_)
+            selected, _inconsistent, extra, _label = store[iter_]
+            if selected and extra:
+                selected_extras.append(extra)
 
         extra_store.foreach(save_extra)
 
-        self.interpreter.extras = selected_extras
+        self.selected_extras = selected_extras
         GLib.idle_add(self.on_extras_ready)
 
-    @watch_errors()
     def on_extras_ready(self, *args):
-        if not self.load_installer_files_page():
-            logger.debug("Installer doesn't require files")
-            self.launch_installer_commands()
+        self.load_installer_files_page()
 
     # Installer Files & Downloading Page
     #
@@ -574,14 +600,22 @@ class InstallerWindow(ModelessDialog,
         else:
             patch_version = None
 
-        self.interpreter.installer.prepare_game_files(patch_version)
+        AsyncCall(self.interpreter.installer.prepare_game_files,
+                  self.on_files_prepared, self.selected_extras, patch_version)
+
+    def on_files_prepared(self, _result, error):
+        if error:
+            self._handle_callback_error(error)
+            return
 
         if not self.interpreter.installer.files:
-            return False
+            logger.debug("Installer doesn't require files")
+            self.launch_installer_commands()
+            return
 
+        logger.debug("Game files prepared.")
         self.installer_files_box.load_installer(self.interpreter.installer)
         self.stack.navigate_to_page(self.present_installer_files_page)
-        return True
 
     def create_installer_files_page(self):
         return Gtk.ScrolledWindow(
@@ -594,9 +628,9 @@ class InstallerWindow(ModelessDialog,
 
     def present_installer_files_page(self):
         """Show installer screen with the file picker / downloader"""
-
+        logger.debug("Presenting installer files page")
         self.set_status(_(
-            "Please review the files needed for the installation then click 'Continue'"))
+            "Please review the files needed for the installation then click 'Install'"))
         self.stack.present_page("installer_files")
         self.display_install_button(self.on_files_confirmed, sensitive=self.installer_files_box.is_ready)
 
@@ -609,12 +643,10 @@ class InstallerWindow(ModelessDialog,
         self.display_install_button(None, sensitive=False)
         return on_exit_page
 
-    @watch_errors()
     def on_files_ready(self, _widget, files_ready):
         """Toggle state of continue button based on ready state"""
         self.display_install_button(self.on_files_confirmed, sensitive=files_ready)
 
-    @watch_errors()
     def on_files_confirmed(self, _button):
         """Call this when the user confirms the install files
         This will start the downloads.
@@ -625,7 +657,6 @@ class InstallerWindow(ModelessDialog,
         except PermissionError as ex:
             raise ScriptingError(_("Unable to get files: %s") % ex) from ex
 
-    @watch_errors()
     def on_files_available(self, widget):
         """All files are available, continue the install"""
         logger.info("All files are available, continuing install")
@@ -636,9 +667,11 @@ class InstallerWindow(ModelessDialog,
         GLib.idle_add(self.launch_installer_commands)
 
     def launch_installer_commands(self):
+        logger.info("Launching installer commands")
         self.install_in_progress = True
         self.load_spinner_page(_("Installing game data"))
         self.stack.discard_navigation()  # once we really start installing, no going back!
+        self.interpreter.installer.install_extras()
         self.interpreter.launch_installer_commands()
 
     # Spinner Page
@@ -748,7 +781,6 @@ class InstallerWindow(ModelessDialog,
         previous_page = self.stack.save_current_page()
         self.stack.jump_to_page(present_input_menu_page)
 
-    @watch_errors()
     def on_input_menu_changed(self, combobox):
         """Enable continue button if a non-empty choice is selected"""
         self.continue_button.set_sensitive(bool(combobox.get_active_id()))
@@ -772,7 +804,7 @@ class InstallerWindow(ModelessDialog,
                     self.load_error_message_page(str(err))
 
             vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            label = InstallerWindow.MarkupLabel(message)
+            label = MarkupLabel(message)
             vbox.pack_start(label, False, False, 0)
 
             buttons_box = Gtk.Box()
@@ -780,10 +812,14 @@ class InstallerWindow(ModelessDialog,
             buttons_box.set_margin_bottom(40)
             vbox.pack_start(buttons_box, False, False, 0)
 
-            autodetect_button = Gtk.Button(label=_("Autodetect"))
-            autodetect_button.connect("clicked", wrapped_callback, requires)
-            autodetect_button.grab_focus()
-            buttons_box.pack_start(autodetect_button, True, True, 40)
+            if not LINUX_SYSTEM.is_flatpak():
+                # Lutris flatplak doesn't autodetect files on CD-ROM properly
+                # and selecting this option doesn't let the user click "Back"
+                # so the only option is to cancel the install.
+                autodetect_button = Gtk.Button(label=_("Autodetect"))
+                autodetect_button.connect("clicked", wrapped_callback, requires)
+                autodetect_button.grab_focus()
+                buttons_box.pack_start(autodetect_button, True, True, 40)
 
             browse_button = Gtk.Button(label=_("Browse…"))
             callback_data = {"callback": wrapped_callback, "requires": requires}
@@ -803,7 +839,6 @@ class InstallerWindow(ModelessDialog,
         previous_page = self.stack.save_current_page()
         self.stack.jump_to_page(present_ask_for_disc_page)
 
-    @watch_errors()
     def on_browse_clicked(self, widget, callback_data):
         dialog = DirectoryDialog(_("Select the folder where the disc is mounted"), parent=self)
         folder = dialog.folder
@@ -811,7 +846,6 @@ class InstallerWindow(ModelessDialog,
         requires = callback_data["requires"]
         callback(widget, requires, folder)
 
-    @watch_errors()
     def on_eject_clicked(self, _widget, data=None):
         self.interpreter.eject_wine_disc()
 
@@ -822,6 +856,7 @@ class InstallerWindow(ModelessDialog,
 
     def load_error_message_page(self, message):
         self.stack.navigate_to_page(lambda *x: self.present_error_page(message))
+        self.stack.set_back_allowed(False)
         self.cancel_button.grab_focus()
 
     def present_error_page(self, message):
@@ -838,16 +873,16 @@ class InstallerWindow(ModelessDialog,
 
     def load_finish_install_page(self, game_id, status):
         if self.config.get("create_desktop_shortcut"):
-            self.create_shortcut(desktop=True)
+            AsyncCall(self.create_shortcut, None, True)
         if self.config.get("create_menu_shortcut"):
-            self.create_shortcut()
+            AsyncCall(self.create_shortcut, None)
 
         # Save game to trigger a game-updated signal,
         # but take care not to create a blank game
         if game_id:
             game = Game(game_id)
             if self.config.get("create_steam_shortcut"):
-                steam_shortcut.create_shortcut(game)
+                AsyncCall(steam_shortcut.create_shortcut, None, game)
             game.save()
 
         self.install_in_progress = False
@@ -868,18 +903,16 @@ class InstallerWindow(ModelessDialog,
                                      continue_button_label=_("_Launch"),
                                      suggested_action=False)
 
-    @watch_errors()
     def on_launch_clicked(self, button):
         """Launch a game after it's been installed."""
         button.set_sensitive(False)
         self.on_cancel_clicked(button)
         game = Game(self.interpreter.installer.game_id)
-        if game.id:
+        if game.is_db_stored:
             game.emit("game-launch")
         else:
             logger.error("Game has no ID, launch button should not be drawn")
 
-    @watch_errors()
     def on_window_focus(self, _widget, *_args):
         """Remove urgency hint (flashing indicator) when window receives focus"""
         self.set_urgency_hint(False)
@@ -934,8 +967,8 @@ class InstallerWindow(ModelessDialog,
     def display_install_button(self, handler, sensitive=True):
         """Displays the continue button, but labels it 'Install'."""
         self.display_continue_button(handler, continue_button_label=_(
-                                     "_Install"), sensitive=sensitive,
-                                     extra_buttons=[self.source_button])
+            "_Install"), sensitive=sensitive,
+            extra_buttons=[self.source_button])
 
     def display_cancel_button(self, extra_buttons=None):
         self.display_buttons(extra_buttons or [])
@@ -968,15 +1001,3 @@ class InstallerWindow(ModelessDialog,
                 any_visible = True
                 break
         self.menu_button.set_visible(any_visible)
-
-    class MarkupLabel(Gtk.Label):
-        """Label for installer window"""
-
-        def __init__(self, markup=None, **kwargs):
-            super().__init__(
-                label=markup,
-                use_markup=True,
-                wrap=True,
-                max_width_chars=80,
-                **kwargs)
-            self.set_alignment(0.5, 0)

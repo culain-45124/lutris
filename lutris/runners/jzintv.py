@@ -2,6 +2,7 @@
 import os
 from gettext import gettext as _
 
+from lutris.exceptions import MissingBiosError, MissingGameExecutableError
 # Lutris Modules
 from lutris.runners.runner import Runner
 from lutris.util import system
@@ -63,7 +64,7 @@ class jzintv(Runner):
 
     def play(self):
         """Run Intellivision game"""
-        arguments = [self.get_executable()]
+        arguments = self.get_command()
 
         selected_resolution = self.runner_config.get("resolution")
         if selected_resolution:
@@ -77,10 +78,10 @@ class jzintv(Runner):
             arguments.append("--execimg=%s/exec.bin" % bios_path)
             arguments.append("--gromimg=%s/grom.bin" % bios_path)
         else:
-            return {"error": "NO_BIOS"}
+            raise MissingBiosError()
         rom_path = self.game_config.get("main_file") or ""
         if not system.path_exists(rom_path):
-            return {"error": "FILE_NOT_FOUND", "file": rom_path}
+            raise MissingGameExecutableError(filename=rom_path)
         romdir = os.path.dirname(rom_path)
         romfile = os.path.basename(rom_path)
         arguments += ["--rom-path=%s/" % romdir]

@@ -61,8 +61,8 @@ class ScummvmService(BaseService):
             "name": db_game["name"],
             "version": "ScummVM",
             "slug": db_game["slug"],
-            "game_slug": slugify(db_game["lutris_slug"]),
-            "runner": "scummvm",
+            "game_slug": self.get_installed_slug(db_game),
+            "runner": self.get_installed_runner_name(db_game),
             "script": {
                 "game": {
                     "game_id": db_game["appid"],
@@ -70,6 +70,12 @@ class ScummvmService(BaseService):
                 }
             }
         }
+
+    def get_installed_slug(self, db_game):
+        return db_game.get("lutris_slug") or slugify(db_game["name"])
+
+    def get_installed_runner_name(self, db_game):
+        return "scummvm"
 
 
 class ScummvmGame(ServiceGame):

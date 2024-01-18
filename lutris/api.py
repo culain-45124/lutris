@@ -1,5 +1,4 @@
 """Functions to interact with the Lutris REST API"""
-import functools
 import json
 import os
 import re
@@ -9,14 +8,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import OrderedDict
+from gettext import gettext as _
+from typing import Any, Dict
 
 import requests
 
 from lutris import settings
 from lutris.util import http, system
+from lutris.util.display import get_gpus_info
 from lutris.util.http import HTTPError, Request
 from lutris.util.linux import LINUX_SYSTEM
 from lutris.util.log import logger
+from lutris.util.strings import time_ago
 
 API_KEY_FILE_PATH = os.path.join(settings.CACHE_DIR, "auth-token")
 USER_INFO_FILE_PATH = os.path.join(settings.CACHE_DIR, "user.json")
@@ -27,8 +30,50 @@ def get_time_from_api_date(date_string):
     return time.strptime(date_string[:date_string.find(".")], "%Y-%m-%dT%H:%M:%S")
 
 
-def load_runtime_versions() -> dict:
-    """Load runtime versions from json file"""
+def get_runtime_versions_date() -> float:
+    return os.path.getmtime(settings.RUNTIME_VERSIONS_PATH)
+
+
+def get_runtime_versions_date_time_ago() -> str:
+    try:
+        return time_ago(get_runtime_versions_date())
+    except FileNotFoundError:
+        return _("never")
+
+
+def check_stale_runtime_versions() -> bool:
+    """True if runtime versions file that download_runtime_versions() creates
+    is missing or stale; if true we must call that function."""
+    try:
+        threshold = time.time() + 6 * 60 * 60  # 6 hours from now
+        modified_at = get_runtime_versions_date()
+        return threshold < modified_at
+    except FileNotFoundError:
+        return True
+
+
+def download_runtime_versions() -> Dict[str, Any]:
+    """Queries runtime + runners + current client versions and stores the result
+    in a file; the mdate of this file is used to decide when it is stale and should
+    be replaced."""
+    gpus_info = get_gpus_info()
+    pci_ids = [" ".join([gpu["PCI_ID"], gpu["PCI_SUBSYS_ID"]]) for gpu in gpus_info.values()]
+
+    url = settings.SITE_URL + "/api/runtimes/versions?pci_ids=" + ",".join(pci_ids)
+    response = http.Request(url, headers={"Content-Type": "application/json"})
+    try:
+        response.get()
+    except http.HTTPError as ex:
+        logger.error("Unable to get runtimes from API: %s", ex)
+        return {}
+    with open(settings.RUNTIME_VERSIONS_PATH, mode="w", encoding="utf-8") as runtime_file:
+        json.dump(response.json, runtime_file, indent=2)
+    return response.json
+
+
+def get_runtime_versions() -> Dict[str, Any]:
+    """Load runtime versions from the json file that is created at startup
+    if it is missing or stale."""
     if not system.path_exists(settings.RUNTIME_VERSIONS_PATH):
         return {}
     with open(settings.RUNTIME_VERSIONS_PATH, mode="r", encoding="utf-8") as runtime_file:
@@ -123,21 +168,31 @@ def download_runner_versions(runner_name: str) -> list:
     return versions
 
 
-@functools.lru_cache()
-def get_default_runner_version(runner_name: str, version: str = "") -> dict:
+def format_runner_version(version_info: Dict[str, str]) -> str:
+    version = version_info.get("version")
+    if not version:
+        return ""
+    arch = version_info.get("architecture")
+    if arch:
+        return "{}-{}".format(version, arch)
+
+    return version
+
+
+def get_default_runner_version_info(runner_name: str, version: str = None) -> Dict[str, str]:
     """Get the appropriate version for a runner
 
     Params:
         version: Optional version to lookup, will return this one if found
 
     Returns:
-        Dict containing version, architecture and url for the runner, None
+        Dict containing version, architecture and url for the runner, an empty dict
         if the data can't be retrieved. If a pseudo-version is accepted, may be
         a dict containing only the version itself.
     """
 
     if not version:
-        runtime_versions = load_runtime_versions()
+        runtime_versions = get_runtime_versions()
         if runtime_versions:
             try:
                 runner_versions = runtime_versions["runners"][runner_name]
@@ -282,6 +337,7 @@ def get_game_details(slug: str) -> dict:
 def normalize_installer(installer: dict) -> dict:
     """Adjusts an installer dict so it is in the correct form, with values
     of the expected types."""
+
     def must_be_str(key):
         if key in installer:
             installer[key] = str(installer[key])
@@ -310,20 +366,6 @@ def search_games(query) -> dict:
     return response.json
 
 
-def download_runtime_versions(pci_ids: list) -> dict:
-    """Queries runtime + runners + current client versions"""
-    url = settings.SITE_URL + "/api/runtimes/versions?pci_ids=" + ",".join(pci_ids)
-    response = http.Request(url, headers={"Content-Type": "application/json"})
-    try:
-        response.get()
-    except http.HTTPError as ex:
-        logger.error("Unable to get runtimes from API: %s", ex)
-        return {}
-    with open(settings.RUNTIME_VERSIONS_PATH, mode="w", encoding="utf-8") as runtime_file:
-        json.dump(response.json, runtime_file, indent=2)
-    return response.json
-
-
 def parse_installer_url(url):
     """
     Parses `lutris:` urls, extracting any info necessary to install or run a game.
@@ -332,14 +374,14 @@ def parse_installer_url(url):
     launch_config_name = None
     try:
         parsed_url = urllib.parse.urlparse(url, scheme="lutris")
-    except Exception:  # pylint: disable=broad-except
+    except Exception as ex:
         logger.warning("Unable to parse url %s", url)
-        return False
+        raise ValueError("Invalid lutris url %s" % url) from ex
     if parsed_url.scheme != "lutris":
-        return False
+        raise ValueError("Invalid lutris url %s" % url)
     url_path = parsed_url.path
     if not url_path:
-        return False
+        raise ValueError("Invalid lutris url %s" % url)
     # urlparse can't parse if the path only contain numbers
     # workaround to remove the scheme manually:
     if url_path.startswith("lutris:"):

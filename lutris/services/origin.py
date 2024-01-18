@@ -16,8 +16,8 @@ from lutris.config import LutrisConfig, write_game_config
 from lutris.database.games import add_game, get_game_by_field
 from lutris.database.services import ServiceGameCollection
 from lutris.game import Game
-from lutris.installer import get_installers
 from lutris.services.base import OnlineService
+from lutris.services.lutris import sync_media
 from lutris.services.service_game import ServiceGame
 from lutris.services.service_media import ServiceMedia
 from lutris.util.log import logger
@@ -304,11 +304,13 @@ class OriginService(OnlineService):
             logger.error("Invalid install of Origin at %s", origin_prefix)
             return
         origin_launcher = OriginLauncher(origin_prefix)
-        installed_games = 0
+        installed_slugs = []
         for manifest in origin_launcher.iter_manifests():
-            self.install_from_origin(origin_game, manifest)
-            installed_games += 1
-        logger.debug("Installed %s Origin games", installed_games)
+            slug = self.install_from_origin(origin_game, manifest)
+            if slug:
+                installed_slugs.append(slug)
+        sync_media(installed_slugs)
+        logger.debug("Installed %s Origin games", len(installed_slugs))
 
     def install_from_origin(self, origin_game, manifest):
         if "id" not in manifest:
@@ -326,10 +328,11 @@ class OriginService(OnlineService):
         game_config = LutrisConfig(game_config_id=origin_game["configpath"]).game_level
         game_config["game"]["args"] = get_launch_arguments(manifest["id"])
         configpath = write_game_config(lutris_game_id, game_config)
-        game_id = add_game(
+        slug = self.get_installed_slug(service_game)
+        add_game(
             name=service_game["name"],
             runner=origin_game["runner"],
-            slug=slugify(service_game["name"]),
+            slug=slug,
             directory=origin_game["directory"],
             installed=1,
             installer_slug=lutris_game_id,
@@ -337,7 +340,7 @@ class OriginService(OnlineService):
             service=self.id,
             service_id=offer_id,
         )
-        return game_id
+        return slug
 
     def generate_installer(self, db_game, origin_db_game):
         origin_game = Game(origin_db_game["id"])
@@ -348,8 +351,8 @@ class OriginService(OnlineService):
             "name": db_game["name"],
             "version": self.name,
             "slug": slugify(db_game["name"]) + "-" + self.id,
-            "game_slug": slugify(db_game["name"]),
-            "runner": self.runner,
+            "game_slug": self.get_installed_slug(db_game),
+            "runner": self.get_installed_runner_name(db_game),
             "appid": db_game["appid"],
             "script": {
                 "requires": self.client_installer,
@@ -370,13 +373,15 @@ class OriginService(OnlineService):
             }
         }
 
+    def get_installed_runner_name(self, db_game):
+        return self.runner
+
     def install(self, db_game):
         origin_game = get_game_by_field(self.client_installer, "slug")
         application = Gio.Application.get_default()
         if not origin_game or not origin_game["installed"]:
             logger.warning("Installing the Origin client")
-            installers = get_installers(game_slug=self.client_installer)
-            application.show_installer_window(installers)
+            application.show_lutris_installer_window(game_slug=self.client_installer)
         else:
             application.show_installer_window(
                 [self.generate_installer(db_game, origin_game)],

@@ -3,9 +3,17 @@
 import os
 import shlex
 from gettext import gettext as _
+from typing import Dict, Tuple
 
 from lutris import runtime, settings
-from lutris.exceptions import EsyncLimitError, FsyncUnsupportedError
+from lutris.api import format_runner_version
+from lutris.config import LutrisConfig
+from lutris.database.games import get_game_by_field
+from lutris.exceptions import (
+    EsyncLimitError, FsyncUnsupportedError, MisconfigurationError, MissingExecutableError, MissingGameExecutableError,
+    UnspecifiedVersionError
+)
+from lutris.game import Game
 from lutris.gui.dialogs import FileDialog
 from lutris.runners.commands.wine import (  # noqa: F401 pylint: disable=unused-import
     create_prefix, delete_registry_key, eject_disc, install_cab_component, open_wine_terminal, set_regedit,
@@ -27,9 +35,9 @@ from lutris.util.wine.extract_icon import PEFILE_AVAILABLE, ExtractIcon
 from lutris.util.wine.prefix import DEFAULT_DLL_OVERRIDES, WinePrefixManager, find_prefix
 from lutris.util.wine.vkd3d import VKD3DManager
 from lutris.util.wine.wine import (
-    WINE_DEFAULT_ARCH, WINE_DIR, WINE_PATHS, detect_arch, get_default_version, get_installed_wine_versions,
-    get_overrides_env, get_proton_paths, get_real_executable, get_system_wine_version, is_esync_limit_set,
-    is_fsync_supported, is_gstreamer_build
+    WINE_DEFAULT_ARCH, WINE_DIR, WINE_PATHS, detect_arch, get_default_wine_runner_version_info,
+    get_default_wine_version, get_installed_wine_versions, get_overrides_env, get_proton_paths, get_real_executable,
+    get_system_wine_version, get_wine_path_for_version, is_esync_limit_set, is_fsync_supported, is_gstreamer_build
 )
 
 
@@ -49,45 +57,18 @@ def _get_dxvk_warning(config, option_key):
         driver_info = drivers.get_nvidia_driver_info()
         return _("<b>Warning</b> Your NVIDIA driver is outdated.\n"
                  "You are currently running driver %s which does not "
-                 "fully support all features for Vulkan and DXVK games.\n"
-                 "Please upgrade your driver as described in our "
-                 "<a href='%s'>installation guide</a>"
+                 "fully support all features for Vulkan and DXVK games."
                  ) % (
             driver_info["nvrm"]["version"],
-            settings.DRIVER_HOWTO_URL,
         )
 
     return None
 
 
-def _get_dxvk_error(config, option_key):
-    """Checks that required libraries are installed on the system"""
-    missing_arch = LINUX_SYSTEM.get_missing_lib_arch("VULKAN")
-    if missing_arch:
-        arches = ", ".join(missing_arch)
-        return _("<b>Error</b> Missing Vulkan libraries\n"
-                 "Lutris was unable to detect Vulkan support for "
-                 "the %s architecture.\n"
-                 "This will prevent many games and programs from working.\n"
-                 "To install it, please use the following guide: "
-                 "<a href='%s'>Installing Graphics Drivers</a>"
-                 ) % (arches, settings.DRIVER_HOWTO_URL)
-
-    if not LINUX_SYSTEM.is_vulkan_supported():
-        return _("<b>Error</b> Vulkan is not installed or is not supported by your system, so DXVK is not available.\n"
-                 "If you have compatible hardware, please follow "
-                 "the installation procedures as described in\n"
-                 "<a href='https://github.com/lutris/docs/blob/master/HowToDXVK.md'>"
-                 "How-to:-DXVK (https://github.com/lutris/docs/blob/master/HowToDXVK.md)</a>"
-                 )
-
-    return None
-
-
 def _get_simple_vulkan_support_error(config, option_key, feature):
-    if not LINUX_SYSTEM.is_vulkan_supported():
+    if config.get(option_key) and not LINUX_SYSTEM.is_vulkan_supported():
         return _("<b>Error</b> Vulkan is not installed or is not supported by your system, "
-                 "so %s is not available.") % feature
+                 "%s is not available.") % feature
     return None
 
 
@@ -119,25 +100,6 @@ def _get_dxvk_version_warning(config, _option_key):
     return None
 
 
-def _get_path_for_version(config, version=None):
-    """Return the absolute path of a wine executable for a given version,
-    or the configured version if you don't ask for a version."""
-    if not version:
-        version = config["version"]
-
-    if version in WINE_PATHS:
-        return system.find_executable(WINE_PATHS[version])
-    if "Proton" in version:
-        for proton_path in get_proton_paths():
-            if os.path.isfile(os.path.join(proton_path, version, "dist/bin/wine")):
-                return os.path.join(proton_path, version, "dist/bin/wine")
-            if os.path.isfile(os.path.join(proton_path, version, "files/bin/wine")):
-                return os.path.join(proton_path, version, "files/bin/wine")
-    if version == "custom":
-        return config.get("custom_wine_path", "")
-    return os.path.join(WINE_DIR, version, "bin/wine")
-
-
 def _get_esync_warning(config, _option_key):
     if config.get("esync"):
         limits_set = is_esync_limit_set()
@@ -154,6 +116,16 @@ def _get_fsync_warning(config, _option_key):
         if not fsync_supported:
             return _("<b>Warning</b> Your kernel is not patched for fsync.")
         return ""
+
+
+def _get_virtual_desktop_warning(config, _option_key):
+    message = _("Wine virtual desktop is no longer supported")
+    if config.get("Desktop"):
+        version = str(config.get("version")).casefold()
+        if "-ge-" in version or "proton" in version:
+            message += "\n"
+            message += _("Virtual desktops cannot be enabled in Proton or GE Wine versions.")
+    return message
 
 
 class wine(Runner):
@@ -258,7 +230,7 @@ class wine(Runner):
                 "label": _("Wine version"),
                 "type": "choice",
                 "choices": get_wine_version_choices,
-                "default": get_default_version(),
+                "default": get_default_wine_version,
                 "help": _(
                     "The version of Wine used to launch the game.\n"
                     "Using the last version is generally recommended, "
@@ -288,7 +260,7 @@ class wine(Runner):
                 "type": "bool",
                 "default": True,
                 "warning": _get_dxvk_warning,
-                "error": _get_dxvk_error,
+                "error": lambda c, k: _get_simple_vulkan_support_error(c, k, _("DXVK")),
                 "active": True,
                 "help": _(
                     "Use DXVK to "
@@ -456,6 +428,8 @@ class wine(Runner):
                 "section": _("Virtual Desktop"),
                 "label": _("Windowed (virtual desktop)"),
                 "type": "bool",
+                "advanced": True,
+                "warning": _get_virtual_desktop_warning,
                 "default": False,
                 "help": _(
                     "Run the whole Windows desktop in a window.\n"
@@ -468,6 +442,7 @@ class wine(Runner):
                 "section": _("Virtual Desktop"),
                 "label": _("Virtual desktop resolution"),
                 "type": "choice_with_entry",
+                "advanced": True,
                 "choices": DISPLAY_MANAGER.get_resolutions,
                 "help": _("The size of the virtual desktop in pixels."),
             },
@@ -476,6 +451,7 @@ class wine(Runner):
                 "section": _("DPI"),
                 "label": _("Enable DPI Scaling"),
                 "type": "bool",
+                "advanced": True,
                 "default": False,
                 "help": _(
                     "Enables the Windows application's DPI scaling.\n"
@@ -487,6 +463,7 @@ class wine(Runner):
                 "section": _("DPI"),
                 "label": _("DPI"),
                 "type": "string",
+                "advanced": True,
                 "help": _(
                     "The DPI to be used if 'Enable DPI Scaling' is turned on.\n"
                     "If blank or 'auto', Lutris will auto-detect this."
@@ -585,10 +562,23 @@ class wine(Runner):
                 "type": "directory_chooser",
                 "section": _("Sandbox"),
                 "label": _("Sandbox directory"),
+                "warn_if_non_writable_parent": True,
                 "help": _("Custom directory for desktop integration folders."),
                 "advanced": True,
             },
         ]
+
+    @property
+    def runner_warning(self):
+        if not get_system_wine_version():
+            return _(
+                "<b>Warning</b> Wine is not installed on your system\n\n"
+                "Having Wine installed on your system guarantees that "
+                "Wine builds from Lutris will have all required dependencies.\nPlease "
+                "follow the instructions given in the <a "
+                "href='https://github.com/lutris/docs/blob/master/WineDependencies.md'>Lutris Wiki</a> to "
+                "install Wine."
+            )
 
     @property
     def context_menu_entries(self):
@@ -601,6 +591,7 @@ class wine(Runner):
             ("winecfg", _("Wine configuration"), self.run_winecfg),
             ("wine-regedit", _("Wine registry"), self.run_regedit),
             ("winecpl", _("Wine Control Panel"), self.run_winecpl),
+            ("winetaskmgr", _("Wine Task Manager"), self.run_taskmgr),
             (None, "-", None),
             ("winetricks", _("Winetricks"), self.run_winetricks),
         ]
@@ -612,7 +603,8 @@ class wine(Runner):
         if not _prefix_path and self.game_config.get("exe"):
             # Find prefix from game if we have one
             _prefix_path = find_prefix(self.game_exe)
-        _prefix_path = os.path.expanduser(_prefix_path)  # just in case!
+        if _prefix_path:
+            _prefix_path = os.path.expanduser(_prefix_path)  # just in case!
         return _prefix_path
 
     @property
@@ -662,33 +654,39 @@ class wine(Runner):
                 arch = WINE_DEFAULT_ARCH
         return arch
 
-    def get_runner_version(self, version=None):
+    def get_runner_version(self, version: str = None) -> Dict[str, str]:
         if not version:
-            version = self.read_version_from_config(use_default=False)
+            default_version_info = get_default_wine_runner_version_info()
+            default_version = format_runner_version(default_version_info) if default_version_info else None
+            version = self.read_version_from_config(default=default_version)
 
         if version in WINE_PATHS:
             return {"version": version}
 
         return super().get_runner_version(version)
 
-    def read_version_from_config(self, use_default=True):
+    def read_version_from_config(self, default: str = None) -> str:
         """Return the Wine version to use. use_default can be set to false to
-        force the installation of a specific wine version"""
+        force the installation of a specific wine version. If no version is configured,
+        we return the default supplied, or the4 global Wine default if none is."""
 
         # We must use the config levels to avoid getting a default if the setting
-        # is not set; we'll fall back to get_default_version() or None rather.
+        # is not set; we'll fall back to get_default_version()
 
         for level in [self.config.game_level, self.config.runner_level]:
             if "wine" in level:
                 runner_version = level["wine"].get("version")
                 if runner_version:
                     return runner_version
-        if use_default:
-            return get_default_version()
 
-    def get_path_for_version(self, version):
+        if default:
+            return default
+
+        return get_default_wine_version()
+
+    def get_path_for_version(self, version: str) -> str:
         """Return the absolute path of a wine executable for a given version"""
-        return _get_path_for_version(self.runner_config, version)
+        return get_wine_path_for_version(version, config=self.runner_config)
 
     def resolve_config_path(self, path, relative_to=None):
         # Resolve paths with tolerance for Windows-isms;
@@ -707,41 +705,101 @@ class wine(Runner):
 
         return resolved
 
-    def get_executable(self, version=None, fallback=True):
+    def get_executable(self, version: str = None, fallback: bool = True) -> str:
         """Return the path to the Wine executable.
         A specific version can be specified if needed.
         """
         if version is None:
             version = self.read_version_from_config()
-        if not version:
-            return
 
         wine_path = self.get_path_for_version(version)
         if system.path_exists(wine_path):
             return wine_path
 
-        if fallback:
-            # Fallback to default version
-            default_version = get_default_version()
-            wine_path = self.get_path_for_version(default_version)
-            if wine_path:
-                # Update the version in the config
-                if version == self.runner_config.get("version"):
-                    self.runner_config["version"] = default_version
-                    # TODO: runner_config is a dict so we have to instanciate a
-                    # LutrisConfig object to save it.
-                    # XXX: The version key could be either in the game specific
-                    # config or the runner specific config. We need to know
-                    # which one to get the correct LutrisConfig object.
-            return wine_path
+        if not fallback:
+            raise MissingExecutableError(_("The Wine executable at '%s' is missing.") % wine_path)
 
-    def is_installed(self, version=None, fallback=True):
+        # Fallback to default version
+        default_version = get_default_wine_version()
+        wine_path = self.get_path_for_version(default_version)
+        if not system.path_exists(wine_path):
+            raise MissingExecutableError(_("The Wine executable at '%s' is missing.") % wine_path)
+
+        # Update the version in the config
+        if version == self.runner_config.get("version"):
+            self.runner_config["version"] = default_version
+            # TODO: runner_config is a dict so we have to instanciate a
+            # LutrisConfig object to save it.
+            # XXX: The version key could be either in the game specific
+            # config or the runner specific config. We need to know
+            # which one to get the correct LutrisConfig object.
+        return wine_path
+
+    def is_installed(self, flatpak_allowed: bool = True, version: str = None, fallback: bool = True) -> bool:
         """Check if Wine is installed.
         If no version is passed, checks if any version of wine is available
         """
-        if version:
-            return system.path_exists(self.get_executable(version, fallback))
-        return bool(get_installed_wine_versions())
+        try:
+            if version:
+                # We don't care where Wine is, but only if it was found at all.
+                self.get_executable(version, fallback)
+                return True
+
+            return bool(get_installed_wine_versions())
+        except MisconfigurationError:
+            return False
+
+    def is_installed_for(self, interpreter):
+        try:
+            version = self.get_installer_runner_version(interpreter.installer, use_api=True)
+            return self.is_installed(version=version, fallback=False)
+        except MisconfigurationError:
+            return False
+
+    def get_installer_runner_version(self, installer, use_runner_config: bool = True, use_api: bool = False) -> str:
+        # If a version is specified in the script choose this one
+        version = None
+        if installer.script.get(installer.runner):
+            version = installer.script[installer.runner].get("version")
+        # If the installer is an extension, use the wine version from the base game
+        elif installer.requires:
+            db_game = get_game_by_field(installer.requires, field="installer_slug")
+            if not db_game:
+                db_game = get_game_by_field(installer.requires, field="slug")
+            if not db_game:
+                raise MisconfigurationError(
+                    _("The required game '%s' could not be found.") % installer.requires)
+            game = Game(db_game["id"])
+            version = game.config.runner_config["version"]
+
+        if not version and use_runner_config:
+            # Try to read the version from the saved runner config for Wine.
+            try:
+                return wine.get_runner_version_and_config()[0]
+            except UnspecifiedVersionError:
+                pass  # prefer the error message below for this
+
+        if not version and use_api:
+            # Try to obtain the default wine version from the Lutris API.
+            default_version_info = self.get_runner_version()
+            if "version" in default_version_info:
+                logger.debug("Default wine version is %s", default_version_info["version"])
+                version = format_runner_version(default_version_info)
+
+        if not version:
+            raise UnspecifiedVersionError(_("The installer does not specify a Wine version."))
+
+        return version
+
+    @classmethod
+    def get_runner_version_and_config(cls) -> Tuple[str, LutrisConfig]:
+        runner_config = LutrisConfig(runner_slug="wine")
+        if "wine" in runner_config.runner_level:
+            config_version = runner_config.runner_level["wine"].get("version")
+            if config_version:
+                return config_version, runner_config
+
+        raise UnspecifiedVersionError(_("The runner configuration does not specify a Wine version."))
 
     @classmethod
     def msi_exec(
@@ -844,6 +902,11 @@ class wine(Runner):
         self.prelaunch()
         self._run_executable("control")
 
+    def run_taskmgr(self, *args):
+        """Execute Wine task manager"""
+        self.prelaunch()
+        self._run_executable("taskmgr")
+
     def run_winekill(self, *args):
         """Runs wineserver -k."""
         winekill(
@@ -865,7 +928,6 @@ class wine(Runner):
             "Desktop": prefix_manager.set_virtual_desktop,
             "WineDesktop": prefix_manager.set_desktop_size,
         }
-
         for key, path in self.reg_keys.items():
             value = self.runner_config.get(key) or "auto"
             if not value or value == "auto" and key not in managed_keys:
@@ -874,6 +936,12 @@ class wine(Runner):
                 if key in managed_keys:
                     # Do not pass fallback 'auto' value to managed keys
                     if value == "auto":
+                        value = None
+                    if value and key in ("Desktop", "WineDesktop") and (
+                        "wine-ge" in self.get_executable().lower()
+                        or "proton" in self.get_executable().lower()
+                    ):
+                        logger.warning("Wine Virtual Desktop can't be used with Wine-GE and Proton")
                         value = None
                     managed_keys[key](value)
                     continue
@@ -904,6 +972,9 @@ class wine(Runner):
         return None
 
     def prelaunch(self):
+        if not get_system_wine_version():
+            logger.warning("Wine is not installed on your system; required dependencies may be missing.")
+
         prefix_path = self.prefix_path
         if prefix_path:
             if not system.path_exists(os.path.join(prefix_path, "user.reg")):
@@ -975,12 +1046,14 @@ class wine(Runner):
         if show_debug == "-all":
             env["DXVK_LOG_LEVEL"] = "none"
         env["WINEARCH"] = self.wine_arch
-        env["WINE"] = self.get_executable()
-        env["WINE_MONO_CACHE_DIR"] = os.path.join(WINE_DIR, self.read_version_from_config(), "mono")
-        env["WINE_GECKO_CACHE_DIR"] = os.path.join(WINE_DIR, self.read_version_from_config(), "gecko")
-        if is_gstreamer_build(self.get_executable()):
-            path_64 = os.path.join(WINE_DIR, self.read_version_from_config(), "lib64/gstreamer-1.0/")
-            path_32 = os.path.join(WINE_DIR, self.read_version_from_config(), "lib/gstreamer-1.0/")
+        wine_exe = self.get_executable()
+        wine_config_version = self.read_version_from_config()
+        env["WINE"] = wine_exe
+        env["WINE_MONO_CACHE_DIR"] = os.path.join(WINE_DIR, wine_config_version, "mono")
+        env["WINE_GECKO_CACHE_DIR"] = os.path.join(WINE_DIR, wine_config_version, "gecko")
+        if is_gstreamer_build(wine_exe):
+            path_64 = os.path.join(WINE_DIR, wine_config_version, "lib64/gstreamer-1.0/")
+            path_32 = os.path.join(WINE_DIR, wine_config_version, "lib/gstreamer-1.0/")
             if os.path.exists(path_64) or os.path.exists(path_32):
                 env["GST_PLUGIN_SYSTEM_PATH_1_0"] = path_64 + ":" + path_32
         if self.prefix_path:
@@ -1015,7 +1088,7 @@ class wine(Runner):
         env["WINEDLLOVERRIDES"] = get_overrides_env(self.dll_overrides)
 
         # Proton support
-        if "Proton" in self.read_version_from_config():
+        if wine_config_version and "Proton" in wine_config_version:
             steam_dir = get_steam_dir()
             if steam_dir:  # May be None for example if Proton-GE is used but Steam is not installed
                 env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = steam_dir
@@ -1032,25 +1105,30 @@ class wine(Runner):
 
     def get_runtime_env(self):
         """Return runtime environment variables with path to wine for Lutris builds"""
-        wine_path = self.get_executable()
-        wine_root = None
-        if WINE_DIR:
-            wine_root = os.path.dirname(os.path.dirname(wine_path))
-        for proton_path in get_proton_paths():
-            if proton_path in wine_path:
-                wine_root = os.path.dirname(os.path.dirname(wine_path))
+        wine_path = None
+        try:
+            exe = self.get_executable()
+            if WINE_DIR:
+                wine_path = os.path.dirname(os.path.dirname(exe))
+            for proton_path in get_proton_paths():
+                if proton_path in exe:
+                    wine_path = os.path.dirname(os.path.dirname(exe))
+        except MisconfigurationError:
+            wine_path = None
+
         return runtime.get_env(
             version="Ubuntu-18.04",
             prefer_system_libs=self.system_config.get("prefer_system_libs", True),
-            wine_path=wine_root,
+            wine_path=wine_path,
         )
 
     def get_pids(self, wine_path=None):
         """Return a list of pids of processes using the current wine exe."""
-        if wine_path:
-            exe = wine_path
-        else:
-            exe = self.get_executable()
+        try:
+            exe = wine_path or self.get_executable()
+        except MisconfigurationError:
+            return set()
+
         if not exe.startswith("/"):
             exe = system.find_executable(exe)
         pids = system.get_pids_using_file(exe)
@@ -1083,7 +1161,7 @@ class wine(Runner):
             launch_info["env"]["WINE_LARGE_ADDRESS_AWARE"] = "1"
 
         if not game_exe or not system.path_exists(game_exe):
-            return {"error": "FILE_NOT_FOUND", "file": game_exe}
+            raise MissingGameExecutableError(filename=game_exe)
 
         if launch_info["env"].get("WINEESYNC") == "1":
             limit_set = is_esync_limit_set()
@@ -1097,7 +1175,7 @@ class wine(Runner):
             if not fsync_supported:
                 raise FsyncUnsupportedError(_("Your kernel is not patched for fsync."))
 
-        command = [self.get_executable()]
+        command = self.get_command()
 
         game_exe, args, _working_dir = get_real_executable(game_exe, self.working_dir)
         command.append(game_exe)

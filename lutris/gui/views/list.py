@@ -8,7 +8,7 @@ from gi.repository import Gdk, Gtk, Pango
 # Lutris Modules
 from lutris import settings
 from lutris.gui.views import (
-    COL_INSTALLED, COL_INSTALLED_AT, COL_INSTALLED_AT_TEXT, COL_LASTPLAYED, COL_LASTPLAYED_TEXT, COL_MEDIA_PATH,
+    COL_ID, COL_INSTALLED, COL_INSTALLED_AT, COL_INSTALLED_AT_TEXT, COL_LASTPLAYED, COL_LASTPLAYED_TEXT, COL_MEDIA_PATH,
     COL_NAME, COL_PLATFORM, COL_PLAYTIME, COL_PLAYTIME_TEXT, COL_RUNNER_HUMAN_NAME, COL_SORTNAME, COL_YEAR, COLUMN_NAMES
 )
 from lutris.gui.views.base import GameView
@@ -32,7 +32,8 @@ class GameListView(Gtk.TreeView, GameView):
             self.image_renderer = GridViewCellRendererImage()
             self.media_column = Gtk.TreeViewColumn("", self.image_renderer,
                                                    media_path=COL_MEDIA_PATH,
-                                                   is_installed=COL_INSTALLED)
+                                                   is_installed=COL_INSTALLED,
+                                                   game_id=COL_ID)
             self.media_column.set_reorderable(True)
             self.media_column.set_sort_indicator(False)
             self.media_column.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
@@ -57,7 +58,7 @@ class GameListView(Gtk.TreeView, GameView):
         self.set_column(default_text_cell, _("Play Time"), COL_PLAYTIME_TEXT, 100)
         self.set_column(default_text_cell, _("Installed At"), COL_INSTALLED_AT_TEXT, 120)
 
-        self.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
+        self.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
 
         self.connect_signals()
         self.connect("row-activated", self.on_row_activated)
@@ -96,8 +97,8 @@ class GameListView(Gtk.TreeView, GameView):
         self.set_column_sort(column_id if sort_id is None else sort_id)
         column.set_resizable(True)
         column.set_reorderable(True)
-        width = settings.read_setting("%s_column_width" % COLUMN_NAMES[column_id], "list view")
-        is_visible = settings.read_setting("%s_visible" % COLUMN_NAMES[column_id], "list view")
+        width = settings.read_setting("%s_column_width" % COLUMN_NAMES[column_id], section="list view")
+        is_visible = settings.read_setting("%s_visible" % COLUMN_NAMES[column_id], section="list view")
         column.set_fixed_width(int(width) if width else default_width)
         column.set_visible(is_visible == "True" or always_visible if is_visible else True)
         self.append_column(column)
@@ -115,17 +116,25 @@ class GameListView(Gtk.TreeView, GameView):
         """Sort a column by using another column's data"""
         self.model.set_sort_func(col, sort_func, sort_col)
 
-    def get_selected_item(self):
-        """Return the currently selected game's id."""
+    def get_path_at(self, x, y):
+        path, _col, _cx, _cy = self.get_path_at_pos(x, y)
+        return path
+
+    def set_selected(self, path):
         selection = self.get_selection()
+        selection.unselect_all()
+        selection.select_path(path)
+
+    def get_selected(self):
+        """Return list of all selected items"""
+        selection = self.get_selection().get_selected_rows()
         if not selection:
             return None
-        _model, select_iter = selection.get_selected()
-        if select_iter:
-            return select_iter
+        return selection[1]
 
-    def select(self):
-        self.set_cursor(self.current_path[0])
+    def get_game_id_for_path(self, path):
+        iterator = self.get_model().get_iter(path)
+        return self.get_model().get_value(iterator, COL_ID)
 
     def set_selected_game(self, game_id):
         row = self.game_store.get_row_by_id(game_id, filtered=True)
@@ -142,11 +151,12 @@ class GameListView(Gtk.TreeView, GameView):
     def on_row_activated(self, widget, line=None, column=None):
         """Handles double clicks"""
         selected_id = self.get_selected_game_id()
-        self.emit("game-activated", selected_id)
+        if selected_id:
+            self.emit("game-activated", selected_id)
 
     def on_cursor_changed(self, widget, _line=None, _column=None):
-        selected_item = self.get_selected_item()
-        self.emit("game-selected", selected_item)
+        selected_items = self.get_selected()
+        self.emit("game-selected", selected_items)
 
     @staticmethod
     def on_column_width_changed(col, *args):

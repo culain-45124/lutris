@@ -164,6 +164,8 @@ class LinuxSystem:  # pylint: disable=too-many-public-methods
     def get_drives():
         """Return a list of drives with their filesystems"""
         lsblk_output = system.read_process_output(["lsblk", "-f", "--json"])
+        if not lsblk_output:
+            return []
         return [
             drive
             for drive in json.loads(lsblk_output)["blockdevices"]
@@ -212,7 +214,7 @@ class LinuxSystem:  # pylint: disable=too-many-public-methods
     def gamemode_available(self):
         """Return whether gamemode is available"""
         # Current versions of gamemode use gamemoderun
-        if system.find_executable("gamemoderun"):
+        if system.can_find_executable("gamemoderun"):
             return True
         # This is for old versions of gamemode only
         if self.is_feature_supported("GAMEMODE"):
@@ -230,18 +232,19 @@ class LinuxSystem:  # pylint: disable=too-many-public-methods
             minimum_nvidia_version_supported = 515
             driver_info = drivers.get_nvidia_driver_info()
             driver_version = driver_info["nvrm"]["version"]
+            if not driver_version:
+                return False
             major_version = int(driver_version.split(".")[0])
             return major_version >= minimum_nvidia_version_supported
         except Exception as ex:
             logger.exception("Unable to determine NVidia version: %s", ex)
             return False
 
-    @property
     def has_steam(self):
         """Return whether Steam is installed locally"""
         return (
-            bool(system.find_executable("steam"))
-            or bool(system.find_executable("com.valvesoftware.Steam"))
+            system.can_find_executable("steam")
+            or system.can_find_executable("com.valvesoftware.Steam")
             or os.path.exists(os.path.expanduser("~/.steam/steam/ubuntu12_32/steam"))
         )
 
@@ -250,7 +253,6 @@ class LinuxSystem:  # pylint: disable=too-many-public-methods
         """Return the display server used"""
         return os.environ.get("XDG_SESSION_TYPE", "unknown")
 
-    @property
     def is_flatpak(self):
         """Check is we are running inside Flatpak sandbox"""
         return system.path_exists("/.flatpak-info")
@@ -478,7 +480,7 @@ def gather_system_info():
     return system_info
 
 
-def gather_system_info_str():
+def gather_system_info_dict():
     """Get all relevant system information already formatted as a string"""
     system_info = gather_system_info()
     system_info_readable = {}
@@ -526,15 +528,7 @@ def gather_system_info_str():
     else:
         graphics_dict["Vulkan"] = "Not Supported"
     system_info_readable["Graphics"] = graphics_dict
-
-    output = ''
-    for section, dictionary in system_info_readable.items():
-        output += '[%s]\n' % section
-        for key, value in dictionary.items():
-            tabs = " " * (16 - len(key))
-            output += '%s:%s%s\n' % (key, tabs, value)
-        output += '\n'
-    return output
+    return system_info_readable
 
 
 def get_terminal_apps():

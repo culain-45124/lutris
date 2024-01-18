@@ -18,6 +18,8 @@ class GameGridView(Gtk.IconView, GameView):
         Gtk.IconView.__init__(self)
         GameView.__init__(self, store.service)
 
+        Gtk.IconView.set_selection_mode(self, Gtk.SelectionMode.MULTIPLE)
+
         self.set_column_spacing(6)
         self._show_badges = True
 
@@ -78,26 +80,31 @@ class GameGridView(Gtk.IconView, GameView):
             self.add_attribute(self.image_renderer, "platform", COL_PLATFORM)
             self.add_attribute(self.image_renderer, "is_installed", COL_INSTALLED)
 
-    def select(self):
-        self.select_path(self.current_path)
+    def get_path_at(self, x, y):
+        return self.get_path_at_pos(x, y)
 
-    def get_selected_item(self):
-        """Return the currently selected game's id."""
-        selection = self.get_selected_items()
-        if not selection:
-            return
-        self.current_path = selection[0]
-        return self.get_model().get_iter(self.current_path)
+    def set_selected(self, path):
+        self.unselect_all()
+        self.select_path(path)
+
+    def get_selected(self):
+        """Return list of all selected items"""
+        return self.get_selected_items()
+
+    def get_game_id_for_path(self, path):
+        iterator = self.get_model().get_iter(path)
+        return self.get_model().get_value(iterator, COL_ID)
 
     def on_item_activated(self, _view, _path):
         """Handles double clicks"""
         selected_id = self.get_selected_game_id()
-        logger.debug("Item activated: %s", selected_id)
-        self.emit("game-activated", selected_id)
+        if selected_id:
+            logger.debug("Item activated: %s", selected_id)
+            self.emit("game-activated", selected_id)
 
     def on_selection_changed(self, _view):
         """Handles selection changes"""
-        selected_items = self.get_selected_item()
+        selected_items = self.get_selected()
         if selected_items:
             self.emit("game-selected", selected_items)
 

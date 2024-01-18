@@ -1,6 +1,7 @@
 # Standard Library
 from gettext import gettext as _
 
+from lutris.exceptions import MissingGameExecutableError
 # Lutris Modules
 from lutris.runners.runner import Runner
 from lutris.util import system
@@ -37,10 +38,10 @@ class osmose(Runner):
 
     def play(self):
         """Run Sega Master System game"""
-        arguments = [self.get_executable()]
+        arguments = self.get_command()
         rom = self.game_config.get("main_file") or ""
         if not system.path_exists(rom):
-            return {"error": "FILE_NOT_FOUND", "file": rom}
+            raise MissingGameExecutableError(filename=rom)
         arguments.append(rom)
         if self.runner_config.get("fullscreen"):
             arguments.append("-fs")

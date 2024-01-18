@@ -1,5 +1,4 @@
 """Check to run at program start"""
-import os
 import sqlite3
 from gettext import gettext as _
 
@@ -21,7 +20,7 @@ from lutris.util.display import display_gpu_info, get_gpus_info
 from lutris.util.graphics import drivers, vkquery
 from lutris.util.linux import LINUX_SYSTEM
 from lutris.util.log import logger
-from lutris.util.system import create_folder, preload_vulkan_gpu_names
+from lutris.util.system import create_folder, load_vulkan_gpu_names
 from lutris.util.wine.dxvk import REQUIRED_VULKAN_API_VERSION
 
 
@@ -29,18 +28,18 @@ def init_dirs():
     """Creates Lutris directories"""
     directories = [
         settings.CONFIG_DIR,
-        os.path.join(settings.CONFIG_DIR, "runners"),
-        os.path.join(settings.CONFIG_DIR, "games"),
+        settings.RUNNERS_CONFIG_DIR,
+        settings.GAME_CONFIG_DIR,
         settings.DATA_DIR,
         settings.ICON_PATH,
-        os.path.join(settings.CACHE_DIR, "banners"),
-        os.path.join(settings.CACHE_DIR, "coverart"),
-        os.path.join(settings.DATA_DIR, "runners"),
+        settings.BANNER_PATH,
+        settings.COVERART_PATH,
+        settings.RUNNER_DIR,
         settings.RUNTIME_DIR,
         settings.CACHE_DIR,
         settings.SHADER_CACHE_DIR,
-        os.path.join(settings.CACHE_DIR, "installer"),
-        os.path.join(settings.CACHE_DIR, "tmp"),
+        settings.INSTALLER_CACHE_DIR,
+        settings.TMP_DIR,
     ]
     for directory in directories:
         create_folder(directory)
@@ -136,22 +135,18 @@ def fill_missing_platforms():
             game.save_platform()
 
 
-def run_all_checks():
+def run_all_checks() -> None:
     """Run all startup checks"""
-    driver_info = get_drivers()
+    get_drivers()  # drivers dict is not used, but may log information
     gpus_info = get_gpus_info()
     for gpu_id, gpu_info in gpus_info.items():
         display_gpu_info(gpu_id, gpu_info)
     check_libs()
     check_vulkan()
     check_gnome()
-    preload_vulkan_gpu_names(len(gpus_info) > 1)
+    load_vulkan_gpu_names(len(gpus_info) > 1)
     fill_missing_platforms()
     build_path_cache()
-    return {
-        "drivers": driver_info,
-        "gpus": gpus_info
-    }
 
 
 def init_lutris():

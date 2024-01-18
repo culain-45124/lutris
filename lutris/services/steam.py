@@ -4,21 +4,23 @@ import os
 from collections import defaultdict
 from gettext import gettext as _
 
-from gi.repository import Gio
-
 from lutris import settings
 from lutris.config import LutrisConfig, write_game_config
+from lutris.database import sql
 from lutris.database.games import add_game, get_game_by_field, get_games
 from lutris.database.services import ServiceGameCollection
 from lutris.game import Game
 from lutris.installer.installer_file import InstallerFile
 from lutris.services.base import BaseService
+from lutris.services.lutris import sync_media
 from lutris.services.service_game import ServiceGame
 from lutris.services.service_media import ServiceMedia
 from lutris.util.log import logger
 from lutris.util.steam.appmanifest import AppManifest, get_appmanifests
 from lutris.util.steam.config import get_active_steamid64, get_steam_library, get_steamapps_dirs
 from lutris.util.strings import slugify
+
+PGA_DB = settings.PGA_DB
 
 
 class SteamBanner(ServiceMedia):
@@ -106,15 +108,24 @@ class SteamService(BaseService):
         self.match_games()
         return steam_games
 
-    def get_installer_files(self, installer, installer_file_id, _selected_extras):
+    def match_game(self, service_game, lutris_game):
+        super().match_game(service_game, lutris_game)
+
+        if service_game:
+            # Copy playtimes from Steam's data
+            for game in get_games(filters={"service": self.id, "service_id": service_game["appid"]}):
+                steam_game_playtime = json.loads(service_game["details"]).get("playtime_forever")
+                playtime = steam_game_playtime / 60
+                sql.db_update(PGA_DB, "games", {"playtime": playtime}, conditions={"id": game["id"]})
+
+    def get_installer_files(self, installer, _installer_file_id, _selected_extras):
         steam_uri = "$STEAM:%s:."
         appid = str(installer.script["game"]["appid"])
-        return [
-            InstallerFile(installer.game_slug, "steam_game", {
-                "url": steam_uri % appid,
-                "filename": appid
-            })
-        ]
+        file = InstallerFile(installer.game_slug, "steam_game", {
+            "url": steam_uri % appid,
+            "filename": appid
+        })
+        return [file], []
 
     def install_from_steam(self, manifest):
         """Create a new Lutris game based on an existing Steam install"""
@@ -133,10 +144,11 @@ class SteamService(BaseService):
         game_config = LutrisConfig().game_level
         game_config["game"]["appid"] = appid
         configpath = write_game_config(lutris_game_id, game_config)
-        game_id = add_game(
+        slug = self.get_installed_slug(service_game)
+        add_game(
             name=service_game["name"],
             runner="steam",
-            slug=slugify(service_game["name"]),
+            slug=slug,
             installed=1,
             installer_slug=lutris_game_id,
             configpath=configpath,
@@ -144,7 +156,7 @@ class SteamService(BaseService):
             service=self.id,
             service_id=appid,
         )
-        return game_id
+        return slug
 
     @property
     def steamapps_paths(self):
@@ -153,6 +165,7 @@ class SteamService(BaseService):
     def add_installed_games(self):
         """Syncs installed Steam games with Lutris"""
         stats = {"installed": 0, "removed": 0, "deduped": 0, "paths": []}
+        installed_slugs = []
         installed_appids = []
         for steamapps_path in self.steamapps_paths:
             for appmanifest_file in get_appmanifests(steamapps_path):
@@ -161,7 +174,9 @@ class SteamService(BaseService):
                 app_manifest_path = os.path.join(steamapps_path, appmanifest_file)
                 app_manifest = AppManifest(app_manifest_path)
                 installed_appids.append(app_manifest.steamid)
-                self.install_from_steam(app_manifest)
+                slug = self.install_from_steam(app_manifest)
+                if slug:
+                    installed_slugs.append(slug)
                 stats["installed"] += 1
         if stats["paths"]:
             logger.debug("%s Steam games detected and installed", stats["installed"])
@@ -197,6 +212,7 @@ class SteamService(BaseService):
                     steam_game.remove(no_signal=True)
                     steam_game.delete(no_signal=True)
                     stats["deduped"] += 1
+        sync_media(installed_slugs)
         logger.debug("%s Steam games deduplicated", stats["deduped"])
 
     def generate_installer(self, db_game):
@@ -205,13 +221,16 @@ class SteamService(BaseService):
             "name": db_game["name"],
             "version": self.name,
             "slug": slugify(db_game["name"]) + "-" + self.id,
-            "game_slug": slugify(db_game["name"]),
-            "runner": self.runner,
+            "game_slug": self.get_installed_slug(db_game),
+            "runner": self.get_installed_runner_name(db_game),
             "appid": db_game["appid"],
             "script": {
                 "game": {"appid": db_game["appid"]}
             }
         }
+
+    def get_installed_runner_name(self, db_game):
+        return self.runner
 
     def install(self, db_game):
         appid = db_game["appid"]
@@ -222,8 +241,4 @@ class SteamService(BaseService):
             game = Game(existing_game.id)
             game.save()
             return
-        service_installers = self.get_installers_from_api(appid)
-        if not service_installers:
-            service_installers = [self.generate_installer(db_game)]
-        application = Gio.Application.get_default()
-        application.show_installer_window(service_installers, service=self, appid=appid)
+        self.install_from_api(db_game, appid)

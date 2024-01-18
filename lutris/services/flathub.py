@@ -6,9 +6,9 @@ from gettext import gettext as _
 from pathlib import Path
 
 import requests
-from gi.repository import Gio
 
 from lutris import settings
+from lutris.exceptions import MissingExecutableError
 from lutris.services.base import BaseService
 from lutris.services.service_game import ServiceGame
 from lutris.services.service_media import ServiceMedia
@@ -88,7 +88,7 @@ class FlathubService(BaseService):
         flatpak_spawn_abspath = shutil.which("flatpak-spawn")
         if flatpak_spawn_abspath:
             return [flatpak_spawn_abspath, "--host", "flatpak"]
-        raise RuntimeError("No flatpak or flatpak-spawn found")
+        raise MissingExecutableError(_("No flatpak or flatpak-spawn found"))
 
     def load(self):
         """Load the available games from Flathub"""
@@ -107,14 +107,10 @@ class FlathubService(BaseService):
         logger.debug("Installing %s from service %s", app_id, self.id)
         # Check if Flathub repo is active on the system
         if not self.is_flathub_remote_active():
-            logger.error("Flathub is not configured on the system. Visit https://flatpak.org/setup/ for instructions.")
-            return
+            raise RuntimeError(
+                _("Flathub is not configured on the system. Visit https://flatpak.org/setup/ for instructions."))
         # Install the game
-        service_installers = self.get_installers_from_api(app_id)
-        if not service_installers:
-            service_installers = [self.generate_installer(db_game)]
-        application = Gio.Application.get_default()
-        application.show_installer_window(service_installers, service=self, appid=app_id)
+        self.install_from_api(db_game, app_id)
 
     def get_installed_apps(self):
         """Get list of installed Flathub apps"""
@@ -162,11 +158,11 @@ class FlathubService(BaseService):
         flatpak_cmd = self.get_flatpak_cmd()
         return {
             "appid": db_game["appid"],
-            "game_slug": slugify(db_game["name"]),
+            "game_slug": self.get_installed_slug(db_game),
             "slug": slugify(db_game["name"]) + "-" + self.id,
             "name": db_game["name"],
             "version": "Flathub",
-            "runner": self.runner,
+            "runner": self.get_installed_runner_name(db_game),
             "script": {
                 "game": {
                     "appid": db_game["appid"],
@@ -181,16 +177,20 @@ class FlathubService(BaseService):
                 "installer": [
                     {
                         "execute":
-                        {
-                            "file": flatpak_cmd[0],
-                            "args": " ".join(flatpak_cmd[1:]) + f" install --app --noninteractive flathub "
-                                    f"app/{db_game['appid']}/{self.arch}/{self.branch}",
-                            "disable_runtime": True
-                        }
+                            {
+                                "file": flatpak_cmd[0],
+                                "args": " ".join(flatpak_cmd[1:])
+                                        + f" install --{self.install_type} --app --noninteractive flathub "
+                                f"app/{db_game['appid']}/{self.arch}/{self.branch}",
+                                "disable_runtime": True
+                            }
                     }
                 ]
             }
         }
+
+    def get_installed_runner_name(self, db_game):
+        return self.runner
 
     def get_game_directory(self, _installer):
         install_type, application, arch, branch = (_installer["script"]["game"][key] for key in

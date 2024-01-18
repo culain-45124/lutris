@@ -2,6 +2,7 @@
 from gettext import gettext as _
 from os import path
 
+from lutris.exceptions import DirectoryNotFoundError, GameConfigError, MissingGameExecutableError
 # Lutris Modules
 from lutris.runners.runner import Runner
 
@@ -97,6 +98,7 @@ class easyrpg(Runner):
             "option": "save_path",
             "type": "directory_chooser",
             "label": _("Save path"),
+            "warn_if_non_writable_parent": True,
             "help": _(
                 "Instead of storing save files in the game directory they are stored in the specified path. "
                 "The directory must exist."
@@ -448,8 +450,8 @@ class easyrpg(Runner):
 
         return env
 
-    def get_runner_command(self):
-        cmd = [self.get_executable()]
+    def get_command(self):
+        cmd = super().get_command()
 
         # Engine
         autobattle_algo = self.runner_config.get("autobattle_algo")
@@ -462,7 +464,7 @@ class easyrpg(Runner):
 
         seed = self.runner_config.get("seed")
         if seed:
-            cmd.extend(("--seed", seed))
+            cmd.extend(("--seed", str(seed)))
 
         # Audio
         if not self.runner_config["audio"]:
@@ -470,11 +472,11 @@ class easyrpg(Runner):
 
         music_volume = self.runner_config.get("music_volume")
         if music_volume:
-            cmd.extend(("--music-volume", music_volume))
+            cmd.extend(("--music-volume", str(music_volume)))
 
         sound_volume = self.runner_config.get("sound_volume")
         if sound_volume:
-            cmd.extend(("--sound-volume", sound_volume))
+            cmd.extend(("--sound-volume", str(sound_volume)))
 
         soundfont = self.runner_config.get("soundfont")
         if soundfont:
@@ -502,7 +504,7 @@ class easyrpg(Runner):
 
         fps_limit = self.runner_config.get("fps_limit")
         if fps_limit:
-            cmd.extend(("--fps-limit", fps_limit))
+            cmd.extend(("--fps-limit", str(fps_limit)))
 
         show_fps = self.runner_config.get("show_fps")
         if show_fps != "off":
@@ -517,7 +519,7 @@ class easyrpg(Runner):
         return cmd
 
     def get_run_data(self):
-        cmd = self.get_runner_command()
+        cmd = self.get_command()
 
         if self.default_path:
             game_path = path.expanduser(self.default_path)
@@ -527,11 +529,11 @@ class easyrpg(Runner):
 
     def play(self):
         if not self.game_path:
-            return {"error": "CUSTOM", "text": _("No game directory provided")}
+            raise GameConfigError(_("No game directory provided"))
         if not path.isdir(self.game_path):
-            return self.directory_not_found(self.game_path)
+            raise DirectoryNotFoundError(directory=self.game_path)
 
-        cmd = self.get_runner_command()
+        cmd = self.get_command()
 
         cmd.extend(("--project-path", self.game_path))
 
@@ -557,7 +559,7 @@ class easyrpg(Runner):
         if save_path:
             save_path = path.expanduser(save_path)
             if not path.isdir(save_path):
-                return self.directory_not_found(save_path)
+                raise DirectoryNotFoundError(directory=self.game_path)
             cmd.extend(("--save-path", save_path))
 
         record_input = self.game_config.get("record_input")
@@ -569,7 +571,7 @@ class easyrpg(Runner):
         if replay_input:
             replay_input = path.expanduser(replay_input)
             if not path.isfile(replay_input):
-                return {"error": "FILE_NOT_FOUND", "file": replay_input}
+                raise MissingGameExecutableError(filename=replay_input)
             cmd.extend(("--replay-input", replay_input))
 
         load_game_id = self.game_config.get("load_game_id")
@@ -600,10 +602,3 @@ class easyrpg(Runner):
             cmd.extend(("--battle-test", battle_test))
 
         return {"command": cmd}
-
-    @staticmethod
-    def directory_not_found(directory):
-        error = _(
-            "The directory {} could not be found"
-        ).format(directory.replace("&", "&amp;"))
-        return {"error": "CUSTOM", "text": error}

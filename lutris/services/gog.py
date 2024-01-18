@@ -4,6 +4,7 @@ import os
 import time
 from collections import defaultdict
 from gettext import gettext as _
+from typing import List
 from urllib.parse import parse_qsl, urlencode, urlparse
 
 from lxml import etree
@@ -17,7 +18,7 @@ from lutris.services.base import OnlineService
 from lutris.services.service_game import ServiceGame
 from lutris.services.service_media import ServiceMedia
 from lutris.util import i18n, system
-from lutris.util.http import HTTPError, Request, UnauthorizedAccess
+from lutris.util.http import HTTPError, Request, UnauthorizedAccessError
 from lutris.util.log import logger
 from lutris.util.strings import human_size, slugify
 
@@ -123,7 +124,7 @@ class GOGService(OnlineService):
             return False
         try:
             user_data = self.get_user_data()
-        except UnauthorizedAccess:
+        except UnauthorizedAccessError:
             logger.warning("GOG token is invalid")
             return False
         return user_data and "username" in user_data
@@ -172,7 +173,7 @@ class GOGService(OnlineService):
             request.get()
         except HTTPError as http_error:
             logger.error(http_error)
-            logger.error("Failed to get token, check your GOG credentials.")
+            logger.error("Failed to get token.")
             logger.warning("Clearing existing credentials")
             self.logout()
             return
@@ -225,10 +226,7 @@ class GOGService(OnlineService):
         try:
             request.get()
         except HTTPError:
-            logger.error(
-                "Failed to request %s, check your GOG credentials",
-                url,
-            )
+            logger.error("Failed to request %s", url)
             return
         return request.json
 
@@ -288,21 +286,29 @@ class GOGService(OnlineService):
         return self.make_api_request(url)
 
     def get_download_info(self, downlink):
-        """Return file download information"""
+        """Return file download information, a list of dict containing the 'url' and
+        'filename' for each file."""
         logger.info("Getting download info for %s", downlink)
         try:
             response = self.make_api_request(downlink)
         except HTTPError as ex:
             logger.error("HTTP error: %s", ex)
-            raise UnavailableGameError(_("The download of '%s' failed.") % downlink) from ex
+            return []
         if not response:
-            raise UnavailableGameError(_("The download of '%s' failed.") % downlink)
+            logger.error("No download info obtained for %s", downlink)
+            return []
+
+        expanded = []
         for field in ("checksum", "downlink"):
             field_url = response[field]
             parsed = urlparse(field_url)
             query = dict(parse_qsl(parsed.query))
-            response[field + "_filename"] = os.path.basename(query.get("path") or parsed.path)
-        return response
+            filename = os.path.basename(query.get("path") or parsed.path)
+            expanded.append({
+                "url": response[field],
+                "filename": filename
+            })
+        return expanded
 
     def get_downloads(self, gogid):
         """Return all available downloads for a GOG ID"""
@@ -326,16 +332,19 @@ class GOGService(OnlineService):
         products = [game, *dlcs] if dlcs else [game]
         all_extras = {}
         for product in products:
-            extras = [
-                {
-                    "name": download.get("name", "").strip().capitalize(),
-                    "type": download.get("type", "").strip(),
-                    "total_size": download.get("total_size", 0),
-                    "id": str(download["id"]),
-                } for download in product["downloads"].get("bonus_content") or []
-            ]
-            if extras:
-                all_extras[product.get("title", "").strip()] = extras
+            # Extras for DLCs you don't own are listed, but are not installable.
+            if product.get("is_installable"):
+                extras = [
+                    {
+                        "name": download.get("name", "").strip().capitalize(),
+                        "type": download.get("type", "").strip(),
+                        "total_size": download.get("total_size", 0),
+                        "id": str(download["id"]),
+                        "downlinks": [f.get("downlink") for f in download.get("files") or []]
+                    } for download in product["downloads"].get("bonus_content") or []
+                ]
+                if extras:
+                    all_extras[product.get("title", "").strip()] = extras
         return all_extras
 
     def get_installers(self, downloads, runner, language="en"):
@@ -381,25 +390,31 @@ class GOGService(OnlineService):
             if not downlink:
                 logger.error("No download information for %s", game_file)
                 continue
-            download_info = self.get_download_info(downlink)
-            for field in ('checksum', 'downlink'):
+            for info in self.get_download_info(downlink):
                 download_links.append({
                     "name": download.get("name", ""),
                     "os": download.get("os", ""),
                     "type": download.get("type", ""),
                     "total_size": download.get("total_size", 0),
                     "id": str(game_file["id"]),
-                    "url": download_info[field],
-                    "filename": download_info[field + "_filename"]
+                    "url": info["url"],
+                    "filename": info["filename"]
                 })
         return download_links
 
-    def get_extra_files(self, downloads, installer, selected_extras):
+    def get_extra_files(self, installer, selected_extras):
         extra_files = []
-        for extra in downloads["bonus_content"]:
-            if str(extra["id"]) not in selected_extras:
-                continue
-            links = self.query_download_links(extra)
+        for extra in selected_extras:
+            if extra.get("downlinks"):
+                links = [info for link in extra.get("downlinks") for info in self.get_download_info(link)]
+            elif str(extra["id"]) in selected_extras:
+                links = self.query_download_links(extra)
+            else:
+                links = []
+
+            if not links:
+                logger.error("No download link for bonus content '%s' could be obtained.", extra.get("name"))
+
             for link in links:
                 if link["filename"].endswith(".xml"):
                     # GOG gives a link for checksum XML files for bonus content
@@ -486,10 +501,13 @@ class GOGService(OnlineService):
                                              self._format_links(installer, installer_file_id, links))]
         else:
             files = []
+
+        extra_files = []
         if selected_extras:
-            for extra_file in self.get_extra_files(downloads, installer, selected_extras):
-                files.append(extra_file)
-        return files
+            for extra_file in self.get_extra_files(installer, selected_extras):
+                extra_files.append(extra_file)
+
+        return files, extra_files
 
     def read_file_checksum(self, file_path):
         """Return the MD5 checksum for a GOG file
@@ -524,7 +542,7 @@ class GOGService(OnlineService):
             "name": db_game["name"],
             "version": "GOG",
             "slug": details["slug"],
-            "game_slug": slugify(db_game["name"]),
+            "game_slug": self.get_installed_slug(db_game),
             "runner": runner,
             "gogid": db_game["appid"],
             "script": {
@@ -536,6 +554,10 @@ class GOGService(OnlineService):
                 "installer": script
             }
         }
+
+    def get_installed_runner_name(self, db_game):
+        platforms = [platform.casefold() for platform in self.get_game_platforms(db_game)]
+        return "linux" if "linux" in platforms else "wine"
 
     def get_games_owned(self):
         """Return IDs of games owned by user"""
@@ -559,7 +581,7 @@ class GOGService(OnlineService):
 
             for file in installfiles:
                 # supports linux
-                if file["os"].lower() == "linux":
+                if file["os"].casefold() == "linux":
                     runner = "linux"
                     script = [{"extract": {"dst": "$CACHE/GOG", "file": dlc_id, "format": "zip"}},
                               {"merge": {"dst": "$GAMEDIR", "src": "$CACHE/GOG/data/noarch/"}}]
@@ -573,7 +595,7 @@ class GOGService(OnlineService):
                     "version": f"{dlc['title']} ({runner})",
                     "slug": dlc["slug"],
                     "description": "DLC for %s" % db_game["name"],
-                    "game_slug": slugify(db_game["name"]),
+                    "game_slug": self.get_installed_slug(db_game),
                     "runner": runner,
                     "is_dlc": True,
                     "dlcid": dlc["id"],
@@ -644,10 +666,10 @@ class GOGService(OnlineService):
             patch_installers.append(installer)
         return patch_installers
 
-    def get_game_platforms(self, db_game):
+    def get_game_platforms(self, db_game: dict) -> List[str]:
         details = db_game.get("details")
         if details:
             worksOn = json.loads(details).get("worksOn")
             if worksOn is not None:
                 return [name for name, works in worksOn.items() if works]
-        return None
+        return []

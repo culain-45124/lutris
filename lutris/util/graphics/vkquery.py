@@ -8,7 +8,8 @@ from ctypes import (
     CDLL, POINTER, Structure, byref, c_char, c_char_p, c_float, c_int32, c_size_t, c_uint8, c_uint32, c_uint64,
     c_void_p, pointer
 )
-from functools import lru_cache
+
+from lutris.util import cache_single
 
 VkResult = c_int32  # enum (size == 4)
 VK_SUCCESS = 0
@@ -242,14 +243,14 @@ class VkPhysicalDeviceProperties(Structure):
     ]
 
 
-@lru_cache(maxsize=None)
-def is_vulkan_supported():
+@cache_single
+def is_vulkan_supported() -> bool:
     """
     Returns True iff vulkan library can be loaded, initialized,
     and reports at least one physical device available.
     """
     try:
-        vulkan = CDLL("libvulkan.so.1")
+        vulkan = _get_vulkan()
     except OSError:
         return False
     app_info = VkApplicationInfo("vkinfo", version=(0, 1, 0))
@@ -259,12 +260,12 @@ def is_vulkan_supported():
     if result != VK_SUCCESS:
         return False
     dev_count = c_uint32(0)
-    result = vulkan.vkEnumeratePhysicalDevices(instance, byref(dev_count), 0)
+    result = vulkan.vkEnumeratePhysicalDevices(instance, byref(dev_count), None)
     vulkan.vkDestroyInstance(instance, 0)
     return result == VK_SUCCESS and dev_count.value > 0
 
 
-@lru_cache(maxsize=None)
+@cache_single
 def get_vulkan_api_version():
     """
     Queries libvulkan to get the API version; if this library is missing
@@ -272,7 +273,7 @@ def get_vulkan_api_version():
     vk_api_version_major() and like methods to parse it.
     """
     try:
-        vulkan = CDLL("libvulkan.so.1")
+        vulkan = _get_vulkan()
     except OSError:
         return None
 
@@ -295,7 +296,7 @@ def get_device_info():
     highest version device is first, and software rendering devices are omitted.
     """
     try:
-        vulkan = CDLL("libvulkan.so.1")
+        vulkan = _get_vulkan()
     except OSError:
         return []
     app_info = VkApplicationInfo("vkinfo", version=(0, 1, 0))
@@ -305,23 +306,19 @@ def get_device_info():
     if result != VK_SUCCESS:
         return []
     dev_count = c_uint32(0)
-    result = vulkan.vkEnumeratePhysicalDevices(instance, byref(dev_count), 0)
+    result = vulkan.vkEnumeratePhysicalDevices(instance, byref(dev_count), None)
     if result != VK_SUCCESS or dev_count.value <= 0:
         return []
 
     devices = (VkPhysicalDevice * dev_count.value)()
-    result = vulkan.vkEnumeratePhysicalDevices(instance, byref(dev_count), byref(devices))
+    result = vulkan.vkEnumeratePhysicalDevices(instance, byref(dev_count), devices)
     if result != VK_SUCCESS:
         return []
-
-    getPhysicalDeviceProperties = vulkan.vkGetPhysicalDeviceProperties
-    getPhysicalDeviceProperties.restype = None
-    getPhysicalDeviceProperties.argtypes = [VkPhysicalDevice, c_void_p]
 
     device_info = []
     for physical_device in devices:
         dev_props = VkPhysicalDeviceProperties()
-        getPhysicalDeviceProperties(physical_device, byref(dev_props))
+        vulkan.vkGetPhysicalDeviceProperties(physical_device, byref(dev_props))
 
         if dev_props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU:
             name = dev_props.deviceName.decode("utf-8")
@@ -331,7 +328,7 @@ def get_device_info():
     return sorted(device_info, key=lambda t: t.api_version, reverse=True)
 
 
-@lru_cache(maxsize=None)
+@cache_single
 def get_expected_api_version():
     """Returns the version tuple of the API version we expect
     to have; it is the least of the Vulkan library API version, and
@@ -356,3 +353,32 @@ def format_version(version):
         return "%s.%s.%s" % (major, minor, patch)
 
     return "(none)"
+
+
+def _get_vulkan():
+    vulkan = CDLL("libvulkan.so.1")
+
+    # Provide function signatures; this is required on platforms where var-args are
+    # passed in some other way than normal args, and is safer in general.
+
+    vkCreateInstance = vulkan.vkCreateInstance
+    vkCreateInstance.restype = VkResult
+    vkCreateInstance.argtypes = [POINTER(VkInstanceCreateInfo), c_void_p, POINTER(VkInstance)]
+
+    vkEnumeratePhysicalDevices = vulkan.vkEnumeratePhysicalDevices
+    vkEnumeratePhysicalDevices.restype = VkResult
+    vkEnumeratePhysicalDevices.argtypes = [VkInstance, POINTER(c_uint32), POINTER(VkPhysicalDevice)]
+
+    vkGetPhysicalDeviceProperties = vulkan.vkGetPhysicalDeviceProperties
+    vkGetPhysicalDeviceProperties.restype = None
+    vkGetPhysicalDeviceProperties.argtypes = [VkPhysicalDevice, POINTER(VkPhysicalDeviceProperties)]
+
+    vkEnumerateInstanceVersion = vulkan.vkEnumerateInstanceVersion
+    vkEnumerateInstanceVersion.restype = VkResult
+    vkEnumerateInstanceVersion.argtypes = [POINTER(c_uint32)]
+
+    vkDestroyInstance = vulkan.vkDestroyInstance
+    vkDestroyInstance.restype = None
+    vkDestroyInstance.argtypes = [VkInstance, c_void_p]
+
+    return vulkan

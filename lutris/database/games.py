@@ -102,6 +102,15 @@ def get_game_for_service(service, appid):
         return existing_games[0]
 
 
+def get_all_installed_game_for_service(service):
+    if service == "lutris":
+        db_games = get_games(filters={"installed": 1})
+        return {g["slug"]: g for g in db_games}
+
+    db_games = get_games(filters={"service": service, "installed": 1})
+    return {g["service_id"]: g for g in db_games}
+
+
 def get_service_games(service):
     """Return the list of all installed games for a service"""
     global _SERVICE_CACHE_ACCESSED
@@ -199,7 +208,7 @@ def get_matching_game(params):
             if game["configpath"] == params.get("configpath"):
                 return game["id"]
         else:
-            if (game["runner"] == params.get("runner") or not all([params.get("runner"), game["runner"]])):
+            if game["runner"] == params.get("runner") or not all([params.get("runner"), game["runner"]]):
                 return game["id"]
     return None
 
